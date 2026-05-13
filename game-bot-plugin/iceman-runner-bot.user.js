@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Iceman Runner Bot
 // @namespace    https://github.com/believeinmeme/token-list
-// @version      2.5.0
-// @description  Dual-zone obstacle recognition: jump over ground ice, stay grounded for sky planes. Adaptive speed detection. Smart 30s submit/skip. Hands-free.
+// @version      2.6.0
+// @description  Learns the obstacle map over runs and anticipates obstacles from memory. Dual-zone pixel scan, adaptive speed, smart 30s submit/skip. Hands-free.
 // @author       believeinmeme
 // @match        https://www.icemancountdown.com/runner*
 // @match        https://www.icemancountdown.com/runner
@@ -14,20 +14,22 @@
 // ==/UserScript==
 
 /**
- * v2.5 – adaptive speed handling
+ * v2.6 – run-based learning system
  *
  * Ground ice  → jump over it
  * Sky plane   → stay grounded (suppress jumping while it passes)
  *
- * v2.5 changes on top of v2.4:
- *  - adaptiveSuppressMs(): suppression time shrinks as game speeds up.
- *    At start ~1100ms, after 2 min ~480ms. Previously fixed 1900ms was
- *    killing the bot at high speed — no time to jump over the next ice block.
- *  - Scan columns pushed further right [0.28-0.64] for much earlier obstacle
- *    detection. colPushPer30s doubled so columns keep advancing with speed.
- *  - Split bgTol into bgTolGnd (ice) and bgTolAir (plane). airHits raised to
- *    10 — prevents city-building background from triggering false duck events.
- *  - Heartbeat tightened to 850ms for slightly faster ice response.
+ * v2.6 new feature: the bot learns the obstacle map and improves every run.
+ *  - Every pixel-scan detection is timestamped and stored in localStorage.
+ *  - After each death, events are merged into a persistent pattern map
+ *    keyed by time-bucket (300ms resolution).
+ *  - After 3 training runs, high-confidence patterns (≥60% for jump,
+ *    ≥72% for duck) are anticipated 500ms BEFORE the pixel scan would
+ *    catch them. The bot acts on memory, not just sight.
+ *  - The more runs completed, the sharper the confidence scores become
+ *    and the earlier/more reliably the bot reacts.
+ *  - Memory persists across page reloads (localStorage). A "Reset" button
+ *    clears it if the map changes or patterns go wrong.
  */
 (function () {
   "use strict";
@@ -100,6 +102,7 @@
     phase: "idle",            // "idle"|"playing"|"over"|"publishing"|"restarting"
     lastPublishedAt: 0,
     detectEnabled: false,     // end-screen detection paused during grace period after restart
+    runLog: [],               // obstacle events logged during the current run (for learning)
   };
 
   const PUBLISH_COOLDOWN_MS = 31_000;
@@ -245,6 +248,90 @@
     return Math.max(480, 1100 - elapsed * 5);
     // 0s → 1100ms · 60s → 800ms · 120s → 500ms · ≥124s → 480ms
   }
+
+  /* ══════════════════════════════════════════════════════════════════════════
+     LEARNING SYSTEM
+     Records pixel-scan events during each run, consolidates them into
+     localStorage after each death. After RUNS_MIN runs, high-confidence
+     patterns are anticipated LOOK_AHEAD ms before the pixel scan would see
+     them — so the bot reacts from memory rather than sight alone.
+  ══════════════════════════════════════════════════════════════════════════ */
+  const MEM_KEY   = "__rb_mem__";
+  const MEM_VER   = 1;
+  const BUCKET_MS = 300;   // 300ms buckets — events within ±150ms merge together
+  const LOOK_AHEAD= 500;   // ms ahead of current elapsed time to check memory
+  const CONF_JUMP = 0.60;  // fraction of runs jump must appear to be anticipated
+  const CONF_DUCK = 0.72;  // higher bar: false duck kills jump window
+  const RUNS_MIN  = 3;     // training runs before anticipation switches on
+
+  let MEM = null;           // { v, runs, p: {"<ms>": {j, d}} }
+  let lastAntBucket = -1;   // prevents re-firing the same bucket twice per run
+
+  function bucketOf(ms) { return Math.round(ms / BUCKET_MS) * BUCKET_MS; }
+
+  function memLoad() {
+    try {
+      const raw = localStorage.getItem(MEM_KEY);
+      if (!raw) return { v: MEM_VER, runs: 0, p: {} };
+      const m = JSON.parse(raw);
+      return (m && m.v === MEM_VER) ? m : { v: MEM_VER, runs: 0, p: {} };
+    } catch (_) { return { v: MEM_VER, runs: 0, p: {} }; }
+  }
+
+  function memSave() {
+    if (!MEM) return;
+    try { localStorage.setItem(MEM_KEY, JSON.stringify(MEM)); } catch (_) {}
+  }
+
+  function memReset() { MEM = { v: MEM_VER, runs: 0, p: {} }; memSave(); updateInfo(); }
+
+  // Reload from storage at the start of every run
+  function memRefresh() { MEM = memLoad(); lastAntBucket = -1; }
+
+  // Log a pixel-scan confirmed obstacle (deduped: same type in adjacent bucket ignored)
+  function memLog(type) {
+    if (!S.active || !S.startTime) return;
+    const t = bucketOf(Date.now() - S.startTime);
+    const last = S.runLog[S.runLog.length - 1];
+    if (last && last.type === type && t - last.t <= BUCKET_MS) return;
+    S.runLog.push({ t, type });
+  }
+
+  // Merge run log into persistent memory; call on game-over
+  function memConsolidate() {
+    if (!MEM || S.runLog.length === 0) { S.runLog = []; return; }
+    MEM.runs = (MEM.runs || 0) + 1;
+    for (const { t, type } of S.runLog) {
+      const key = String(t);
+      if (!MEM.p[key]) MEM.p[key] = { j: 0, d: 0 };
+      if (type === "jump") MEM.p[key].j++; else MEM.p[key].d++;
+    }
+    // Prune impossibly late buckets (>10 min) to keep storage lean
+    for (const key of Object.keys(MEM.p)) {
+      if (Number(key) > 600_000) delete MEM.p[key];
+    }
+    memSave();
+    S.runLog = [];
+    updateInfo();
+  }
+
+  // Return anticipated action ("jump"|"duck"|null) for the approaching time window
+  function memAnticipate() {
+    if (!MEM || MEM.runs < RUNS_MIN || !S.startTime) return null;
+    const target = bucketOf(Date.now() - S.startTime + LOOK_AHEAD);
+    if (target === lastAntBucket) return null;
+    const b = MEM.p[String(target)];
+    if (!b) return null;
+    if (b.j >= b.d) {
+      if (b.j / MEM.runs >= CONF_JUMP) { lastAntBucket = target; return "jump"; }
+    } else {
+      if (b.d / MEM.runs >= CONF_DUCK) { lastAntBucket = target; return "duck"; }
+    }
+    return null;
+  }
+
+  function memPatternCount() { return MEM ? Object.keys(MEM.p).length : 0; }
+  function memRunCount()     { return MEM ? (MEM.runs || 0) : 0; }
 
   function hashSample() {
     if (!S.ctx || S.tainted) return 0;
@@ -400,9 +487,16 @@
       if (!S.tainted) {
         const type = detectObstacle();
         if (type === "jump" && !isInAir()) {
-          pressJump();  // ice on ground → jump over it
+          memLog("jump");   // record for learning before acting
+          pressJump();      // ice on ground → jump over it
         } else if (type === "duck") {
-          pressDuck();  // plane in sky → suppress jumping, stay grounded
+          memLog("duck");   // record for learning before acting
+          pressDuck();      // plane in sky → suppress jumping, stay grounded
+        } else {
+          // Nothing in the pixel scan — check learned memory for what's coming
+          const ant = memAnticipate();
+          if      (ant === "jump" && !isInAir() && !isSuppressed()) pressJump();
+          else if (ant === "duck" && !isSuppressed())               pressDuck();
         }
 
         // Game-over detection via canvas hash
@@ -455,6 +549,7 @@
     S.phase = "over";
     stopRhythm();
     S.detectEnabled = false; // pause end-screen detection while we handle this
+    memConsolidate();         // save this run's obstacle log to persistent memory
 
     if (canSubmit()) {
       setStatus("Game over – submitting score…");
@@ -487,8 +582,10 @@
       S.lastChangeAt = Date.now();
       S.prevHash     = 0;
       S.frame        = 0;
+      S.runLog       = [];     // fresh log for this run
       S.suppressJumpUntil = 0; // clear any plane suppression from the dead run
       S.phase        = "playing";
+      memRefresh();            // reload memory (captures pattern count updates)
       setStatus("Running…");
 
       // Grace period: don't check for end screen for restartGraceMs after restart.
@@ -509,6 +606,8 @@
     S.lastChangeAt = Date.now(); S.frame = 0;
     S.phase    = "playing";
     S.suppressJumpUntil = 0;
+    S.runLog   = [];
+    memRefresh();      // load persisted patterns from previous sessions
     if (!S.canvas) findCanvas();
     calibrateBg();
     sendStart();
@@ -570,12 +669,13 @@
         "font:12px/1.5 monospace","min-width:200px","box-shadow:0 6px 28px rgba(0,0,0,.7)",
         "border:1px solid #2a3050","backdrop-filter:blur(6px)","user-select:none"].join(";");
       p.innerHTML = `
-<div id="__rbh__" style="font-size:14px;font-weight:700;color:#7af;margin-bottom:10px;cursor:move;letter-spacing:.4px">⚡ Runner Bot v2.5</div>
+<div id="__rbh__" style="font-size:14px;font-weight:700;color:#7af;margin-bottom:10px;cursor:move;letter-spacing:.4px">⚡ Runner Bot v2.6</div>
 <div id="__rbs__" style="color:#888;margin-bottom:5px">● Idle</div>
 <div id="__rbi__" style="color:#444;font-size:10px;margin-bottom:10px">Searching for canvas…</div>
 <button id="__rbb__" style="width:100%;padding:8px 0;cursor:pointer;border:none;border-radius:7px;background:linear-gradient(135deg,#1c8,#0a5);color:#fff;font:700 12px monospace">▶  Start Bot</button>
-<div style="margin-top:10px;color:#333;font-size:10px;line-height:1.8">
-  ice→jump · plane→stay · 30s submit/skip ✓
+<div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between">
+  <span style="color:#333;font-size:10px">ice→jump · plane→stay · learns map ✧</span>
+  <button id="__rbr__" style="padding:2px 7px;font:10px monospace;border:1px solid #2a3050;border-radius:4px;background:#0e1020;color:#556;cursor:pointer" title="Clear learned patterns">✕ mem</button>
 </div>`;
     }
 
@@ -588,6 +688,14 @@
     const doToggle = e => { if (e.cancelable) e.preventDefault(); S.active ? stopBot() : startBot(); };
     S.btn.addEventListener("click",    doToggle);
     S.btn.addEventListener("touchend", doToggle, { passive: false });
+
+    const resetBtn = p.querySelector("#__rbr__");
+    if (resetBtn) {
+      resetBtn.addEventListener("click", e => {
+        e.stopPropagation();
+        if (confirm("Clear all learned patterns? The bot will re-learn from the next run.")) memReset();
+      });
+    }
 
     // Touch drag
     let sx=0,sy=0,sl=0,st=0,drag=false;
@@ -625,15 +733,25 @@
     if (!S.active || S.phase !== "playing") return;
     const sec  = (Date.now() - S.startTime) / 1000 | 0;
     const time = String(sec / 60 | 0).padStart(2,"0") + ":" + String(sec % 60).padStart(2,"0");
-    const sup  = isSuppressed() ? " ✈" : "";  // show plane-suppression indicator
-    setStatus(`Running ${time} · ${S.jumpCount}j${sup}`);
+    const sup  = isSuppressed() ? " ✈" : "";
+    const runs = memRunCount();
+    const memStr = runs > 0
+      ? (runs < RUNS_MIN ? ` · learn ${runs}/${RUNS_MIN}` : ` · ✧${runs}r`)
+      : "";
+    setStatus(`Running ${time} · ${S.jumpCount}j${sup}${memStr}`);
   }
 
   function updateInfo() {
-    if (!S.infoEl || !S.canvas) return;
+    if (!S.infoEl) return;
+    const pats = memPatternCount();
+    const runs = memRunCount();
+    const memStr = pats > 0
+      ? ` · ${pats}pat/${runs}r`
+      : (runs > 0 ? ` · learning…` : "");
+    if (!S.canvas) { S.infoEl.textContent = `Searching…${memStr}`; return; }
     S.infoEl.textContent = S.tainted
-      ? "rhythm mode"
-      : `${S.canvas.width}×${S.canvas.height} · ice↑ plane✈`;
+      ? `rhythm mode${memStr}`
+      : `${S.canvas.width}×${S.canvas.height}${memStr}`;
   }
 
   /* ── canvas watcher ─────────────────────────────────────────────────────── */
