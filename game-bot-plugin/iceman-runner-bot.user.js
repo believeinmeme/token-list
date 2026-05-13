@@ -1,11 +1,10 @@
 // ==UserScript==
 // @name         Iceman Runner Bot
 // @namespace    https://github.com/believeinmeme/token-list
-// @version      2.7.0
-// @description  Learns the obstacle map over runs and anticipates obstacles from memory. Dual-zone pixel scan, adaptive speed, reliable leaderboard submit. Hands-free.
+// @version      3.0.0
+// @description  Self-learning runner bot. Dual-zone pixel scan + memory anticipation + adaptive speed + reliable leaderboard submit. Fully hands-free.
 // @author       believeinmeme
 // @match        https://www.icemancountdown.com/runner*
-// @match        https://www.icemancountdown.com/runner
 // @run-at       document-idle
 // @grant        none
 // @noframes
@@ -14,43 +13,176 @@
 // ==/UserScript==
 
 /**
- * v2.6 – run-based learning system
+ * Iceman Runner Bot v3.0 — final release
  *
- * Ground ice  → jump over it
- * Sky plane   → stay grounded (suppress jumping while it passes)
+ * OBSTACLE RECOGNITION
+ *   Ground ice  → jump    (lower canvas zone, vs ground-bg colour)
+ *   Sky plane   → stay    (mid-canvas zone,   vs sky-bg colour)
+ *   Independent background calibrations for each zone — ice-vs-ground
+ *   and plane-vs-sky are measured correctly, not conflated.
  *
- * v2.6 new feature: the bot learns the obstacle map and improves every run.
- *  - Every pixel-scan detection is timestamped and stored in localStorage.
- *  - After each death, events are merged into a persistent pattern map
- *    keyed by time-bucket (300ms resolution).
- *  - After 3 training runs, high-confidence patterns (≥60% for jump,
- *    ≥72% for duck) are anticipated 500ms BEFORE the pixel scan would
- *    catch them. The bot acts on memory, not just sight.
- *  - The more runs completed, the sharper the confidence scores become
- *    and the earlier/more reliably the bot reacts.
- *  - Memory persists across page reloads (localStorage). A "Reset" button
- *    clears it if the map changes or patterns go wrong.
+ * LEARNING SYSTEM
+ *   Every pixel-scan detection is time-stamped into localStorage by
+ *   300 ms bucket. After 3 training runs, patterns with ≥60% confidence
+ *   (jump) or ≥72% (duck) are anticipated 500 ms before the scan sees
+ *   them. Memory sharpens with every run and survives page reloads.
+ *
+ * ADAPTIVE SPEED
+ *   Scan columns shift right every 30 s (longer look-ahead as speed rises).
+ *   Plane-suppression window shrinks from ~1100 ms → 480 ms over 2 min.
+ *   Heartbeat safety-net jump every 850 ms, respects plane suppression.
+ *
+ * SUBMISSION FLOW
+ *   Game-over → tick T&C checkbox → click SUBMIT (3 retries over 3.4 s).
+ *   If within 30 s cooldown → show score 2.2 s → SKIP → restart.
+ *   Leaderboard modal (CLOSE button) dismissed automatically after submit.
+ *   7.5 s total before next run; 5.5 s on the skip path.
+ *
+ * RELIABILITY ADDITIONS (v3.0)
+ *   • Screen Wake Lock  — prevents iOS from sleeping mid-run.
+ *   • Visibility guard  — resets canvas hash when tab is backgrounded
+ *                         so a tab-switch never triggers a false game-over.
+ *   • Watchdog timer    — if stuck outside "playing" phase for > 12 s,
+ *                         force-restarts the bot.
+ *   • Phase timestamps  — atomic setPhase() keeps the watchdog accurate.
+ *   • sweepPopups guard — excluded from "over" phase so doPublish() has
+ *                         exclusive control of the submission flow.
+ *   • memReset double-tap — confirm() is overridden to true game-wide,
+ *                           so reset requires two taps within 2 s.
  */
 (function () {
   "use strict";
 
-  /* ── idempotency ─────────────────────────────────────────────────────────── */
+  /* ── idempotency: bookmarklet re-tap toggles the bot ─────────────────── */
   if (window.__RB_ACTIVE__ !== undefined) { window.__RB_TOGGLE__(); return; }
 
-  /* ══════════════════════════════════════════════════════════════════════════
-     POPUP AUTO-APPROVE  (runs from page load, catches all native dialogs)
-  ══════════════════════════════════════════════════════════════════════════ */
+  /* ── override native dialogs (game can't block progress with alert/confirm) */
   window.confirm = () => true;
   window.alert   = () => undefined;
-  window.prompt  = (_, def) => (def !== undefined ? def : "");
+  window.prompt  = (_, d) => (d !== undefined ? d : "");
 
-  // RE_PUBLISH must NOT match "leaderboard" — that opens the leaderboard modal,
-  // it does NOT submit the score, and clicking it gets the bot stuck.
-  const RE_PUBLISH = /^\s*submit\s*$|^\s*publish\s*$|submit[\s\S]{0,20}score/i;
-  const RE_CLOSE   = /^\s*(close|dismiss|done|got.?it)\s*$/i;  // leaderboard modal close
-  const RE_APPROVE = /\b(ok|yes|confirm|accept|continue|send|save)\b/i;
+  /* ══════════════════════════════════════════════════════════════════════════
+     BUTTON-TEXT REGEXES
+     RE_PUBLISH must NOT contain "leaderboard" — clicking "VIEW LEADERBOARD"
+     opens the loading modal and gets the bot permanently stuck.
+  ══════════════════════════════════════════════════════════════════════════ */
+  const RE_PUBLISH = /^\s*(submit|publish)\s*$|submit[\s\S]{0,20}score/i;
+  const RE_CLOSE   = /^\s*(close|dismiss|done|got.?it)\s*$/i;
+  const RE_APPROVE = /^\s*(ok|yes|confirm|accept|continue|send|save)\s*$/i;
   const RE_RESTART = /^\s*skip\s*$|play.?again|try.?again|restart|new.?game|retry/i;
 
+  /* ══════════════════════════════════════════════════════════════════════════
+     STATE
+  ══════════════════════════════════════════════════════════════════════════ */
+  const S = {
+    active: false,
+    phase:  "idle",   // "idle"|"playing"|"over"|"publishing"|"restarting"
+    phaseAt: 0,       // timestamp of last phase transition (for watchdog)
+
+    canvas: null, ctx: null, tainted: false,
+    bgSky: null, bgGnd: null,
+
+    lastJumpAt: 0, lastDuckAt: 0, suppressJumpUntil: 0,
+    jumpCount: 0, startTime: 0, lastChangeAt: 0, prevHash: 0, frame: 0,
+
+    rafId: null, calTimer: null, restartTid: null,
+    rhythmTid: null, heartbeatTid: null, watchdogTid: null,
+
+    gameObj: null,
+    panel: null, statusEl: null, infoEl: null, btn: null,
+
+    lastPublishedAt: 0,
+    detectEnabled: false,
+    runLog: [],
+    wakeLock: null,
+  };
+
+  const PUBLISH_COOLDOWN_MS = 31_000;
+
+  /* ══════════════════════════════════════════════════════════════════════════
+     CONFIG
+  ══════════════════════════════════════════════════════════════════════════ */
+  const C = {
+    // jump / duck
+    jumpCooldown:  380,   // min ms between jumps
+    duckCooldown:  280,
+    jumpAirMs:     620,   // estimated air time (prevents double-jump)
+    duckHoldMs:    220,
+    heartbeatMs:   850,   // safety-net jump when no obstacle detected
+
+    // game loop
+    gameOverMs:   2000,   // ms canvas must freeze before declaring game-over
+    publishWait:  1400,   // ms after game-over → first SUBMIT attempt
+    publishRetry1:1900,   // ms after attempt 1 → retry 2
+    publishRetry2:3400,   // ms after attempt 1 → retry 3
+    restartDelay: 7500,   // ms total game-over → restart (submit path)
+    skipClickMs:  2200,   // ms after game-over → click SKIP
+    skipRestartMs:5500,   // ms total game-over → restart (skip path)
+    restartGraceMs:3500,  // ms post-restart during which end-screen detection is off
+    calIntervalMs:8000,   // background recalibration interval
+    watchdogMs:  12_000,  // max ms allowed outside "playing" before force-restart
+
+    // pixel detection
+    bgTolGnd:      55,    // colour-distance threshold — ice vs ground
+    bgTolAir:      60,    // colour-distance threshold — plane vs sky
+    groundHits:     4,    // min differing pixels to confirm ice
+    airHits:       10,    // min differing pixels to confirm plane (high: avoids city-bg noise)
+    hashEvery:      4,    // check canvas hash every N frames
+
+    // scan zones (fraction of canvas height)
+    groundTop: 0.65, groundBot: 0.90,   // ice zone
+    airTop:    0.24, airBot:    0.55,   // plane zone (non-overlapping)
+
+    // scan columns (fraction of canvas width) — pushed right as speed rises
+    baseCols: [0.28, 0.40, 0.52, 0.64],
+    colPushPer30s: 0.04, colPushMax: 0.16, colMax: 0.80,
+
+    // rhythm fallback (tainted canvas)
+    rhythmBase: 900, rhythmMinMs: 480, rhythmStep: 28, rhythmEvery: 20,
+  };
+
+  /* ══════════════════════════════════════════════════════════════════════════
+     PHASE HELPER — updates phase and stamps the time for the watchdog
+  ══════════════════════════════════════════════════════════════════════════ */
+  function setPhase(p) { S.phase = p; S.phaseAt = Date.now(); }
+
+  /* ══════════════════════════════════════════════════════════════════════════
+     GAME-OBJECT HOOK — calls engine jump/duck directly when available
+  ══════════════════════════════════════════════════════════════════════════ */
+  const GAME_NAMES = ["game","Game","runner","Runner","App","app","GameScene","mainGame","scene","phaser"];
+
+  function findGameObj() {
+    if (S.gameObj) return S.gameObj;
+    for (const n of GAME_NAMES) {
+      try {
+        const v = window[n];
+        if (!v || typeof v !== "object") continue;
+        const p = v.player || v.runner || v;
+        if (typeof p.jump === "function" || typeof p.doJump === "function" ||
+            typeof p.duck === "function" || typeof p.crouch === "function") {
+          S.gameObj = v; return v;
+        }
+      } catch (_) {}
+    }
+    return null;
+  }
+
+  function callFn(path) {
+    const g = findGameObj(); if (!g) return false;
+    const p = g.player || g.runner || g;
+    const map = {
+      jump:    [p.jump, p.doJump, g.jump],
+      duck:    [p.duck, p.crouch, g.duck],
+      start:   [g.start, g.restart, g.reset],
+      restart: [g.restart, g.reset, g.start],
+    };
+    for (const f of (map[path] || [])) if (typeof f === "function") { try { f.call(p); } catch (_) {} return true; }
+    return false;
+  }
+
+  /* ══════════════════════════════════════════════════════════════════════════
+     UI HELPERS
+  ══════════════════════════════════════════════════════════════════════════ */
   function elVisible(el) {
     if (!el || el.closest("#__rb__")) return false;
     const r = el.getBoundingClientRect();
@@ -71,149 +203,43 @@
 
   function checkAllCheckboxes() {
     document.querySelectorAll('input[type="checkbox"]:not(#__rb__ *)').forEach(cb => {
-      if (cb.closest("#__rb__") || !elVisible(cb) || cb.checked) return;
+      if (!elVisible(cb) || cb.checked) return;
       cb.checked = true;
       ["change", "input", "click"].forEach(t => cb.dispatchEvent(new Event(t, { bubbles: true })));
     });
   }
 
-  // Dismiss the "LEADERBOARD Loading…" modal (and any similar overlay).
-  // Uses a broader selector than clickMatching() because the CLOSE button is
-  // sometimes a <div> or <a> rather than a <button>.
+  // Dismiss leaderboard modal or any blocking overlay.
+  // First tries standard button selectors, then falls back to class-name hints
+  // (avoids scanning every DOM node while still catching <div>/<a> close buttons).
   function closeOverlay() {
-    // Try standard button elements first
     if (clickMatching(RE_CLOSE)) return true;
-    // Fall back to any visible leaf element whose text is exactly "CLOSE" / "DONE" etc.
-    for (const el of document.querySelectorAll('*:not(#__rb__ *)')) {
+    const extra = [
+      'a:not(#__rb__ *)',
+      '[class*="close"]:not(#__rb__ *)',
+      '[class*="btn"]:not(#__rb__ *)',
+      '[class*="button"]:not(#__rb__ *)',
+    ].join(",");
+    for (const el of document.querySelectorAll(extra)) {
       if (!elVisible(el)) continue;
-      if (el.children.length > 0) continue; // skip containers
       const txt = (el.textContent || "").trim();
-      if (RE_CLOSE.test(txt)) { el.click(); return true; }
+      if (txt.length < 20 && RE_CLOSE.test(txt)) { el.click(); return true; }
     }
     return false;
   }
 
+  // General popup sweeper — called outside "playing" and "over" phases only.
+  // "over" is excluded so doPublish() has sole control of the submission flow.
   function sweepPopups() {
-    // Priority order: close any leaderboard modal → tick checkbox → submit → approve → restart
     closeOverlay();
     checkAllCheckboxes();
-    setTimeout(() => { clickMatching(RE_PUBLISH) || clickMatching(RE_APPROVE) || clickMatching(RE_RESTART); }, 150);
-  }
-
-  // Only sweep outside of active gameplay (prevents clicking game UI buttons during a run)
-  new MutationObserver(() => { if (!S.active || S.phase !== "playing") sweepPopups(); })
-    .observe(document.documentElement, { childList: true, subtree: true });
-  setInterval(() => { if (!S.active || S.phase !== "playing") sweepPopups(); }, 400);
-
-  /* ══════════════════════════════════════════════════════════════════════════
-     STATE
-  ══════════════════════════════════════════════════════════════════════════ */
-  const S = {
-    active: false, canvas: null, ctx: null,
-    bgSky: null,      // background colour of the sky zone  (for plane detection)
-    bgGnd: null,      // background colour of the ground zone (for ice detection)
-    tainted: false,
-    rafId: null, calTimer: null, restartTid: null, rhythmTid: null, heartbeatTid: null,
-    lastJumpAt: 0, lastDuckAt: 0,
-    suppressJumpUntil: 0,   // ms timestamp – no jumping allowed while Date.now() < this
-    jumpCount: 0, startTime: 0,
-    lastChangeAt: 0, prevHash: 0,
-    frame: 0, gameObj: null,
-    panel: null, statusEl: null, infoEl: null, btn: null,
-    phase: "idle",            // "idle"|"playing"|"over"|"publishing"|"restarting"
-    lastPublishedAt: 0,
-    detectEnabled: false,     // end-screen detection paused during grace period after restart
-    runLog: [],               // obstacle events logged during the current run (for learning)
-  };
-
-  const PUBLISH_COOLDOWN_MS = 31_000;
-
-  /* ══════════════════════════════════════════════════════════════════════════
-     CONFIG
-  ══════════════════════════════════════════════════════════════════════════ */
-  const C = {
-    // ── jump timing ──────────────────────────────────────────────────────
-    jumpCooldown:  380,   // ms min between jumps
-    duckCooldown:  280,
-    jumpAirMs:     620,   // estimated jump arc duration
-    duckHoldMs:    220,
-    // suppressMs is now computed adaptively — see adaptiveSuppressMs()
-    heartbeatMs:   850,   // ms – safety-net jump interval (only when NOT suppressed)
-
-    // ── game loop ─────────────────────────────────────────────────────────
-    gameOverMs:    1800,  // ms of canvas silence → game-over
-    publishWait:   1300,  // ms after game-over before first SUBMIT attempt (popup load time)
-    publishRetry1: 1800,  // ms after first attempt before retry
-    publishRetry2: 3200,  // ms after first attempt before final retry
-    restartDelay:  7000,  // ms total from game-over to restart (submit path)
-    skipClickMs:   2200,  // ms after game-over before clicking SKIP (let user see score)
-    skipRestartMs: 5500,  // ms total from game-over to restart (skip path)
-    restartGraceMs:3500,  // ms after restart where end-screen detection is paused
-    calIntervalMs: 8000,
-
-    // ── pixel detection ───────────────────────────────────────────────────
-    bgTolGnd:     55,     // colour distance for ice (ground zone)
-    bgTolAir:     60,     // colour distance for plane (sky zone) — slightly stricter
-    groundHits:    4,     // pixels needed to call it a ground ice obstacle
-    airHits:      10,     // pixels needed to call it a sky plane — higher threshold
-                          // prevents city-building bg from causing false duck events
-    hashEvery:     3,
-
-    // ── scan zones (fraction of canvas height) ────────────────────────────
-    // Ground zone: where ice obstacles live (lower part of screen)
-    groundTop: 0.65, groundBot: 0.90,
-    // Air zone:    where planes fly (mid-screen, NOT overlapping ground zone)
-    airTop:    0.24, airBot:    0.55,
-
-    // ── scan columns (fraction of canvas width) ───────────────────────────
-    // 4 columns further right = much more lead time at high speed.
-    // colPushPer30s is aggressive so columns keep advancing as game accelerates.
-    baseCols: [0.28, 0.40, 0.52, 0.64],
-    colPushPer30s: 0.04, colPushMax: 0.16, colMax: 0.80,
-
-    // ── rhythm fallback (tainted canvas) ─────────────────────────────────
-    rhythmBase:    900,
-    rhythmMinMs:   480,
-    rhythmStep:     28,
-    rhythmEvery:    20,
-  };
-
-  /* ══════════════════════════════════════════════════════════════════════════
-     GAME-OBJECT HOOK
-  ══════════════════════════════════════════════════════════════════════════ */
-  const GAME_NAMES = ["game","Game","runner","Runner","App","app","GameScene","mainGame","scene","phaser"];
-
-  function findGameObj() {
-    if (S.gameObj) return S.gameObj;
-    for (const n of GAME_NAMES) {
-      try {
-        const v = window[n];
-        if (!v || typeof v !== "object") continue;
-        const p = v.player || v.runner || v;
-        if (typeof p.jump==="function"||typeof p.doJump==="function"||
-            typeof p.duck==="function"||typeof p.crouch==="function") {
-          S.gameObj = v; return v;
-        }
-      } catch (_) {}
-    }
-    return null;
-  }
-
-  function callFn(path) {
-    const g = findGameObj(); if (!g) return false;
-    const p = g.player || g.runner || g;
-    const map = {
-      jump:    [p.jump, p.doJump, g.jump],
-      duck:    [p.duck, p.crouch, g.duck],
-      start:   [g.start, g.restart, g.reset],
-      restart: [g.restart, g.reset, g.start],
-    };
-    for (const f of (map[path] || [])) if (typeof f === "function") { f.call(p); return true; }
-    return false;
+    setTimeout(() => {
+      clickMatching(RE_PUBLISH) || clickMatching(RE_APPROVE) || clickMatching(RE_RESTART);
+    }, 150);
   }
 
   /* ══════════════════════════════════════════════════════════════════════════
-     CANVAS  +  DUAL-ZONE BACKGROUND CALIBRATION
+     CANVAS + DUAL-ZONE BACKGROUND CALIBRATION
   ══════════════════════════════════════════════════════════════════════════ */
   function findCanvas() {
     const all = Array.from(document.querySelectorAll("canvas"))
@@ -225,79 +251,70 @@
     return false;
   }
 
-  function avgColor(data) {
-    let r = 0, g = 0, b = 0, n = data.data.length / 4;
-    for (let i = 0; i < data.data.length; i += 4) { r += data.data[i]; g += data.data[i+1]; b += data.data[i+2]; }
+  function avgColor(d) {
+    let r = 0, g = 0, b = 0, n = d.data.length / 4;
+    for (let i = 0; i < d.data.length; i += 4) { r += d.data[i]; g += d.data[i+1]; b += d.data[i+2]; }
     return { r: r/n, g: g/n, b: b/n };
   }
 
   function calibrateBg() {
     if (!S.ctx || S.tainted) return;
-    const { canvas: cv, ctx } = S;
-
-    // Sky background: top-left corner — used to detect planes against the sky
-    const skyW = Math.max(2, cv.width  * 0.07 | 0);
-    const skyH = Math.max(2, cv.height * 0.07 | 0);
-    try { S.bgSky = avgColor(ctx.getImageData(2, 2, skyW, skyH)); }
-    catch (_) { S.tainted = true; return; }
-
-    // Ground background: far-left edge at ground level (behind the player, no obstacles).
-    // Sampling here gives us the true colour of the ground/snow so ice obstacles
-    // (which are a different shade) stand out clearly.
-    const gX = Math.max(1, cv.width  * 0.02 | 0);
-    const gY = Math.max(1, cv.height * C.groundTop | 0);
-    const gW = Math.max(2, cv.width  * 0.05 | 0);
-    const gH = Math.max(2, cv.height * (C.groundBot - C.groundTop) | 0);
-    try { S.bgGnd = avgColor(ctx.getImageData(gX, gY, gW, gH)); }
-    catch (_) {}
+    const cv = S.canvas, ctx = S.ctx;
+    // Sky: top-left corner — reference for plane detection
+    try {
+      S.bgSky = avgColor(ctx.getImageData(2, 2,
+        Math.max(2, cv.width * 0.07 | 0),
+        Math.max(2, cv.height * 0.07 | 0)));
+    } catch (_) { S.tainted = true; return; }
+    // Ground: far-left at ground level — reference for ice detection
+    try {
+      S.bgGnd = avgColor(ctx.getImageData(
+        Math.max(1, cv.width  * 0.02 | 0),
+        Math.max(1, cv.height * C.groundTop | 0),
+        Math.max(2, cv.width  * 0.05 | 0),
+        Math.max(2, cv.height * (C.groundBot - C.groundTop) | 0)));
+    } catch (_) {}
   }
 
-  // Is pixel (r,g,b) different from the sky background? → plane detected
   function isSkyObs(r, g, b) {
     if (!S.bgSky) return false;
-    return Math.abs(r-S.bgSky.r) + Math.abs(g-S.bgSky.g) + Math.abs(b-S.bgSky.b) > C.bgTolAir;
+    return Math.abs(r - S.bgSky.r) + Math.abs(g - S.bgSky.g) + Math.abs(b - S.bgSky.b) > C.bgTolAir;
   }
 
-  // Is pixel (r,g,b) different from the ground background? → ice obstacle detected
   function isGndObs(r, g, b) {
     if (!S.bgGnd) return false;
-    return Math.abs(r-S.bgGnd.r) + Math.abs(g-S.bgGnd.g) + Math.abs(b-S.bgGnd.b) > C.bgTolGnd;
+    return Math.abs(r - S.bgGnd.r) + Math.abs(g - S.bgGnd.g) + Math.abs(b - S.bgGnd.b) > C.bgTolGnd;
   }
 
-  // How long to suppress jumping after seeing a plane.
-  // Starts at ~1100ms and shrinks as the game speeds up (obstacles pass faster).
-  // Formula: 1100 - 5ms per second of elapsed play time, floor 480ms.
-  function adaptiveSuppressMs() {
-    const elapsed = S.active ? (Date.now() - S.startTime) / 1000 : 0;
+  // Suppression window shrinks as game speeds up — planes pass faster at high speed
+  function suppressMs() {
+    const elapsed = S.startTime ? (Date.now() - S.startTime) / 1000 : 0;
     return Math.max(480, 1100 - elapsed * 5);
-    // 0s → 1100ms · 60s → 800ms · 120s → 500ms · ≥124s → 480ms
+    // 0 s → 1100 ms   60 s → 800 ms   120 s → 500 ms   ≥ 124 s → 480 ms
   }
 
   /* ══════════════════════════════════════════════════════════════════════════
      LEARNING SYSTEM
-     Records pixel-scan events during each run, consolidates them into
-     localStorage after each death. After RUNS_MIN runs, high-confidence
-     patterns are anticipated LOOK_AHEAD ms before the pixel scan would see
-     them — so the bot reacts from memory rather than sight alone.
+     Time-stamps every confirmed obstacle and persists it to localStorage
+     in 300 ms buckets. After 3 training runs, high-confidence patterns
+     are fired 500 ms BEFORE the pixel scan would see them.
   ══════════════════════════════════════════════════════════════════════════ */
-  const MEM_KEY   = "__rb_mem__";
-  const MEM_VER   = 1;
-  const BUCKET_MS = 300;   // 300ms buckets — events within ±150ms merge together
-  const LOOK_AHEAD= 500;   // ms ahead of current elapsed time to check memory
-  const CONF_JUMP = 0.60;  // fraction of runs jump must appear to be anticipated
-  const CONF_DUCK = 0.72;  // higher bar: false duck kills jump window
-  const RUNS_MIN  = 3;     // training runs before anticipation switches on
+  const MEM_KEY    = "__rb_mem__";
+  const MEM_VER    = 2;       // bump if schema changes — old data auto-discarded
+  const BUCKET_MS  = 300;
+  const LOOK_AHEAD = 500;
+  const CONF_JUMP  = 0.60;
+  const CONF_DUCK  = 0.72;    // higher bar: false duck blocks jumps for ~800 ms
+  const RUNS_MIN   = 3;
 
-  let MEM = null;           // { v, runs, p: {"<ms>": {j, d}} }
-  let lastAntBucket = -1;   // prevents re-firing the same bucket twice per run
+  let MEM = null;
+  let lastAntBucket = -1;
 
   function bucketOf(ms) { return Math.round(ms / BUCKET_MS) * BUCKET_MS; }
 
   function memLoad() {
     try {
-      const raw = localStorage.getItem(MEM_KEY);
-      if (!raw) return { v: MEM_VER, runs: 0, p: {} };
-      const m = JSON.parse(raw);
+      const m = JSON.parse(localStorage.getItem(MEM_KEY) || "null");
       return (m && m.v === MEM_VER) ? m : { v: MEM_VER, runs: 0, p: {} };
     } catch (_) { return { v: MEM_VER, runs: 0, p: {} }; }
   }
@@ -309,107 +326,100 @@
 
   function memReset() { MEM = { v: MEM_VER, runs: 0, p: {} }; memSave(); updateInfo(); }
 
-  // Reload from storage at the start of every run
   function memRefresh() { MEM = memLoad(); lastAntBucket = -1; }
 
-  // Log a pixel-scan confirmed obstacle (deduped: same type in adjacent bucket ignored)
+  // Log a pixel-scan-confirmed obstacle. Deduped: same type in the same or
+  // adjacent bucket is ignored to avoid inflating pattern counts.
   function memLog(type) {
     if (!S.active || !S.startTime) return;
-    const t = bucketOf(Date.now() - S.startTime);
+    const t    = bucketOf(Date.now() - S.startTime);
     const last = S.runLog[S.runLog.length - 1];
     if (last && last.type === type && t - last.t <= BUCKET_MS) return;
     S.runLog.push({ t, type });
   }
 
-  // Merge run log into persistent memory; call on game-over
+  // Merge this run's log into persistent memory. Only increments run count
+  // when there is actual data (avoids inflating denominator on empty runs).
   function memConsolidate() {
-    if (!MEM || S.runLog.length === 0) { S.runLog = []; return; }
+    if (!MEM || !S.runLog.length) { S.runLog = []; return; }
     MEM.runs = (MEM.runs || 0) + 1;
     for (const { t, type } of S.runLog) {
-      const key = String(t);
-      if (!MEM.p[key]) MEM.p[key] = { j: 0, d: 0 };
-      if (type === "jump") MEM.p[key].j++; else MEM.p[key].d++;
+      const k = String(t);
+      if (!MEM.p[k]) MEM.p[k] = { j: 0, d: 0 };
+      if (type === "jump") MEM.p[k].j++; else MEM.p[k].d++;
     }
-    // Prune impossibly late buckets (>10 min) to keep storage lean
-    for (const key of Object.keys(MEM.p)) {
-      if (Number(key) > 600_000) delete MEM.p[key];
-    }
+    for (const k of Object.keys(MEM.p)) if (Number(k) > 600_000) delete MEM.p[k];
     memSave();
     S.runLog = [];
     updateInfo();
   }
 
-  // Return anticipated action ("jump"|"duck"|null) for the approaching time window
+  // Returns anticipated action ("jump"|"duck"|null) for the near future.
+  // Guards: minimum runs, minimum confidence, no repeat within same bucket.
   function memAnticipate() {
     if (!MEM || MEM.runs < RUNS_MIN || !S.startTime) return null;
     const target = bucketOf(Date.now() - S.startTime + LOOK_AHEAD);
     if (target === lastAntBucket) return null;
     const b = MEM.p[String(target)];
     if (!b) return null;
-    if (b.j >= b.d) {
-      if (b.j / MEM.runs >= CONF_JUMP) { lastAntBucket = target; return "jump"; }
+    const bj = b.j || 0, bd = b.d || 0;
+    if (bj >= bd) {
+      if (bj / MEM.runs >= CONF_JUMP) { lastAntBucket = target; return "jump"; }
     } else {
-      if (b.d / MEM.runs >= CONF_DUCK) { lastAntBucket = target; return "duck"; }
+      if (bd / MEM.runs >= CONF_DUCK) { lastAntBucket = target; return "duck"; }
     }
     return null;
   }
 
-  function memPatternCount() { return MEM ? Object.keys(MEM.p).length : 0; }
   function memRunCount()     { return MEM ? (MEM.runs || 0) : 0; }
+  function memPatternCount() { return MEM ? Object.keys(MEM.p).length : 0; }
 
+  /* ══════════════════════════════════════════════════════════════════════════
+     CANVAS HASH + ADAPTIVE SCAN COLUMNS
+  ══════════════════════════════════════════════════════════════════════════ */
   function hashSample() {
     if (!S.ctx || S.tainted) return 0;
-    const { canvas: cv, ctx } = S;
-    let data;
-    try { data = ctx.getImageData(cv.width*0.5|0, cv.height*0.5|0, 10, 4); }
-    catch (_) { S.tainted = true; return 0; }
-    let h = 0;
-    for (let i = 0; i < data.data.length; i += 8) h = (h * 31 + data.data[i]) | 0;
-    return h;
+    try {
+      const d = S.ctx.getImageData(S.canvas.width * 0.5 | 0, S.canvas.height * 0.5 | 0, 10, 4);
+      let h = 0;
+      for (let i = 0; i < d.data.length; i += 8) h = (h * 31 + d.data[i]) | 0;
+      return h;
+    } catch (_) { S.tainted = true; return 0; }
   }
 
   function getScanCols() {
-    const elapsed = S.active ? (Date.now() - S.startTime) / 1000 : 0;
+    const elapsed = S.startTime ? (Date.now() - S.startTime) / 1000 : 0;
     const push = Math.min(C.colPushMax, (elapsed / 30 | 0) * C.colPushPer30s);
     return C.baseCols.map(col => Math.min(C.colMax, col + push));
   }
 
   /* ══════════════════════════════════════════════════════════════════════════
-     OBSTACLE DETECTION  –  two independent zones, two independent bg colours
+     OBSTACLE DETECTION — two independent zones, two independent bg colours
   ══════════════════════════════════════════════════════════════════════════ */
   function detectObstacle() {
     if (!S.ctx || !S.canvas || S.tainted) return null;
-    const { canvas: cv, ctx } = S;
-    const W = cv.width, H = cv.height;
+    const W = S.canvas.width, H = S.canvas.height;
     const cols = getScanCols();
-
-    const gY = H * C.groundTop | 0;
-    const gH = Math.max(1, H * (C.groundBot - C.groundTop) | 0);
-    const aY = H * C.airTop    | 0;
-    const aH = Math.max(1, H * (C.airBot    - C.airTop)    | 0);
-
-    let groundPixels = 0, airPixels = 0;
+    const gY = H * C.groundTop | 0, gH = Math.max(1, H * (C.groundBot - C.groundTop) | 0);
+    const aY = H * C.airTop    | 0, aH = Math.max(1, H * (C.airBot    - C.airTop)    | 0);
+    let groundPx = 0, airPx = 0;
 
     for (const frac of cols) {
       const sx = Math.min(W - 1, W * frac | 0);
       let gd, ad;
-      try { gd = ctx.getImageData(sx, gY, 1, gH); ad = ctx.getImageData(sx, aY, 1, aH); }
+      try { gd = S.ctx.getImageData(sx, gY, 1, gH); ad = S.ctx.getImageData(sx, aY, 1, aH); }
       catch (_) { S.tainted = true; return null; }
-
-      for (let i = 0; i < gd.data.length; i += 4)
-        if (isGndObs(gd.data[i], gd.data[i+1], gd.data[i+2])) groundPixels++;
-      for (let i = 0; i < ad.data.length; i += 4)
-        if (isSkyObs(ad.data[i], ad.data[i+1], ad.data[i+2])) airPixels++;
+      for (let i = 0; i < gd.data.length; i += 4) if (isGndObs(gd.data[i], gd.data[i+1], gd.data[i+2])) groundPx++;
+      for (let i = 0; i < ad.data.length; i += 4) if (isSkyObs(ad.data[i], ad.data[i+1], ad.data[i+2])) airPx++;
     }
 
-    // Plane (sky) check takes priority: if detected, suppress jumping immediately.
-    if (airPixels    >= C.airHits)    return "duck";
-    if (groundPixels >= C.groundHits) return "jump";
+    if (airPx    >= C.airHits)    return "duck";   // plane takes priority
+    if (groundPx >= C.groundHits) return "jump";
     return null;
   }
 
   /* ══════════════════════════════════════════════════════════════════════════
-     INPUT SIMULATION
+     INPUT SIMULATION — keyboard + touch + pointer events + game API
   ══════════════════════════════════════════════════════════════════════════ */
   function key(type, k, code, kc) {
     const e = new KeyboardEvent(type, { key: k, code, keyCode: kc, which: kc, bubbles: true, cancelable: true });
@@ -422,43 +432,49 @@
     const cx = r.left + r.width * 0.5, cy = r.top + r.height * 0.72;
     if (typeof TouchEvent !== "undefined") {
       try {
-        const t = new Touch({ identifier: Date.now() & 0xffff, target: S.canvas, clientX: cx, clientY: cy, screenX: cx, screenY: cy, pageX: cx + scrollX, pageY: cy + scrollY, radiusX: 2, radiusY: 2, rotationAngle: 0, force: 1 });
-        S.canvas.dispatchEvent(new TouchEvent(down ? "touchstart" : "touchend", { bubbles: true, cancelable: true, touches: down ? [t] : [], targetTouches: down ? [t] : [], changedTouches: [t] }));
+        const t = new Touch({
+          identifier: Date.now() & 0xffff, target: S.canvas,
+          clientX: cx, clientY: cy, screenX: cx, screenY: cy,
+          pageX: cx + (window.scrollX || 0), pageY: cy + (window.scrollY || 0),
+          radiusX: 2, radiusY: 2, rotationAngle: 0, force: 1,
+        });
+        S.canvas.dispatchEvent(new TouchEvent(down ? "touchstart" : "touchend", {
+          bubbles: true, cancelable: true,
+          touches: down ? [t] : [], targetTouches: down ? [t] : [], changedTouches: [t],
+        }));
       } catch (_) {}
     }
-    try { S.canvas.dispatchEvent(new PointerEvent(down ? "pointerdown" : "pointerup", { bubbles: true, cancelable: true, clientX: cx, clientY: cy, isPrimary: true })); } catch (_) {}
-    if (!down) { try { S.canvas.dispatchEvent(new MouseEvent("click", { bubbles: true, clientX: cx, clientY: cy })); } catch (_) {} }
+    try {
+      S.canvas.dispatchEvent(new PointerEvent(down ? "pointerdown" : "pointerup",
+        { bubbles: true, cancelable: true, clientX: cx, clientY: cy, isPrimary: true }));
+    } catch (_) {}
+    if (!down) {
+      try { S.canvas.dispatchEvent(new MouseEvent("click", { bubbles: true, clientX: cx, clientY: cy })); } catch (_) {}
+    }
   }
 
-  function isInAir() { return (Date.now() - S.lastJumpAt) < C.jumpAirMs; }
-  function isSuppressed() { return Date.now() < S.suppressJumpUntil; }
+  const isInAir      = () => (Date.now() - S.lastJumpAt)    < C.jumpAirMs;
+  const isSuppressed = () => Date.now() < S.suppressJumpUntil;
 
   function pressJump() {
+    if (!S.active) return;
     const now = Date.now();
     if (now - S.lastJumpAt < C.jumpCooldown) return;
-    if (isSuppressed()) return; // plane incoming — stay on the ground!
+    if (isSuppressed()) return;
     S.lastJumpAt = now; S.jumpCount++;
-
     callFn("jump");
     key("keydown", " ",       "Space",   32);
     key("keydown", "ArrowUp", "ArrowUp", 38);
     tapCanvas(true);
-    setTimeout(() => {
-      key("keyup", " ",       "Space",   32);
-      key("keyup", "ArrowUp", "ArrowUp", 38);
-      tapCanvas(false);
-    }, 90);
+    setTimeout(() => { key("keyup", " ", "Space", 32); key("keyup", "ArrowUp", "ArrowUp", 38); tapCanvas(false); }, 90);
   }
 
   function pressDuck() {
+    if (!S.active) return;
     const now = Date.now();
     if (now - S.lastDuckAt < C.duckCooldown) return;
     S.lastDuckAt = now;
-
-    // Extend jump suppression: plane is nearby, don't jump until it passes.
-    // Duration shrinks as game speeds up so we can jump again sooner.
-    S.suppressJumpUntil = Math.max(S.suppressJumpUntil, now + adaptiveSuppressMs());
-
+    S.suppressJumpUntil = Math.max(S.suppressJumpUntil, now + suppressMs());
     callFn("duck");
     key("keydown", "ArrowDown", "ArrowDown", 40);
     setTimeout(() => key("keyup", "ArrowDown", "ArrowDown", 40), C.duckHoldMs);
@@ -473,20 +489,17 @@
   }
 
   /* ══════════════════════════════════════════════════════════════════════════
-     RHYTHM FALLBACK  (tainted canvas — can't read pixels)
-     When canvas is tainted we can't distinguish obstacle types.
-     Rhythm mode keeps a steady beat; it won't be perfect but it's the best
-     possible without pixel access.
+     RHYTHM FALLBACK  (canvas tainted — pixel reads blocked by browser)
   ══════════════════════════════════════════════════════════════════════════ */
   function startRhythm() {
     if (S.rhythmTid) return;
-    setStatus("Rhythm mode");
+    setStatus("Rhythm mode (pixel scan blocked)");
     const sched = () => {
-      const elapsed = S.active ? (Date.now() - S.startTime) / 1000 : 0;
+      const elapsed = S.startTime ? (Date.now() - S.startTime) / 1000 : 0;
       const ms = Math.max(C.rhythmMinMs, C.rhythmBase - (elapsed / C.rhythmEvery | 0) * C.rhythmStep);
       S.rhythmTid = setTimeout(() => {
-        if (!S.active) return;
-        if (!isSuppressed()) pressJump(); // respect suppression even in rhythm mode
+        if (!S.active || S.rhythmTid === null) return;
+        if (!isSuppressed()) pressJump();
         sched();
       }, ms);
     };
@@ -509,21 +522,20 @@
 
     if (S.phase === "playing") {
       if (!S.tainted) {
-        const type = detectObstacle();
-        if (type === "jump" && !isInAir()) {
-          memLog("jump");   // record for learning before acting
-          pressJump();      // ice on ground → jump over it
-        } else if (type === "duck") {
-          memLog("duck");   // record for learning before acting
-          pressDuck();      // plane in sky → suppress jumping, stay grounded
+        const obs = detectObstacle();
+        if (obs === "jump" && !isInAir()) {
+          memLog("jump");
+          pressJump();
+        } else if (obs === "duck") {
+          memLog("duck");
+          pressDuck();
         } else {
-          // Nothing in the pixel scan — check learned memory for what's coming
+          // No pixel obstacle — check learned memory for what's coming next
           const ant = memAnticipate();
           if      (ant === "jump" && !isInAir() && !isSuppressed()) pressJump();
           else if (ant === "duck" && !isSuppressed())               pressDuck();
         }
 
-        // Game-over detection via canvas hash
         if (S.frame % C.hashEvery === 0) {
           const h = hashSample();
           if (h !== S.prevHash) { S.prevHash = h; S.lastChangeAt = Date.now(); }
@@ -531,7 +543,6 @@
         }
       } else {
         startRhythm();
-        // Still detect game-over even in rhythm mode
         if (S.frame % C.hashEvery === 0) {
           const h = hashSample();
           if (h !== S.prevHash) { S.prevHash = h; S.lastChangeAt = Date.now(); }
@@ -546,103 +557,86 @@
 
   /* ══════════════════════════════════════════════════════════════════════════
      END-SCREEN DOM DETECTION
-     Looks for the "END RUN & SUBMIT" overlay (SUBMIT + SKIP visible together).
-     detectEnabled is false for restartGraceMs after every restart so leftover
-     buttons from the previous form can't trigger a false game-over.
+     Polls for SUBMIT + SKIP visible together — the unique signature of the
+     end-run form. Disabled for restartGraceMs after every restart to
+     prevent leftover buttons from triggering a false game-over.
   ══════════════════════════════════════════════════════════════════════════ */
   function detectEndScreen() {
-    if (!S.detectEnabled || S.phase !== "playing") return;
-    const btns = Array.from(document.querySelectorAll(
+    if (!S.active || !S.detectEnabled || S.phase !== "playing") return;
+    const btns  = Array.from(document.querySelectorAll(
       'button:not(#__rb__ *), [role="button"]:not(#__rb__ *)'
     )).filter(elVisible);
     const texts = btns.map(b => b.textContent.trim().toLowerCase());
-    // Both SUBMIT and SKIP must be visible simultaneously — unique to the end-run form
-    if (texts.includes("submit") && texts.includes("skip")) {
-      onGameOver();
-    }
+    if (texts.includes("submit") && texts.includes("skip")) onGameOver();
   }
-  setInterval(detectEndScreen, 300);
 
   /* ══════════════════════════════════════════════════════════════════════════
-     GAME LOOP  –  playing → over → (submit | skip) → restarting → playing
+     GAME LOOP  —  playing → over → (submit | skip) → restarting → playing
   ══════════════════════════════════════════════════════════════════════════ */
   function canSubmit() { return Date.now() - S.lastPublishedAt >= PUBLISH_COOLDOWN_MS; }
 
-  // Dedicated submit flow: tick checkbox → click SUBMIT → retry twice → close leaderboard.
-  // Called C.publishWait ms after game-over (gives popup time to fully render).
+  // Dedicated submit flow: tick checkbox → click SUBMIT (3 retries) → close leaderboard.
+  // Runs publishWait ms after game-over so the popup is fully rendered.
+  // sweepPopups is excluded from "over" phase, so this has exclusive control.
   function doPublish() {
-    S.phase = "publishing";
-    S.lastPublishedAt = Date.now(); // start cooldown now so we don't double-submit
+    setPhase("publishing");
+    S.lastPublishedAt = Date.now(); // start cooldown immediately to prevent double-submit
 
-    function attempt(label) {
+    function attempt(n) {
       checkAllCheckboxes();
       setTimeout(() => {
         const ok = clickMatching(RE_PUBLISH);
-        setStatus(ok ? `Submitted ✓ (${label}) — restarting in 5s…` : `Waiting for SUBMIT… (${label})`);
+        setStatus(ok ? `Score submitted (${n}/3) — restarting in 5s…` : `Submitting… (${n}/3)`);
       }, 350);
     }
 
-    // Attempt 1 — immediately after publishWait
-    attempt("1/3");
-    // Attempt 2 — 1.8 s later in case form needed more time / checkbox state propagation
-    setTimeout(() => attempt("2/3"), C.publishRetry1);
-    // Attempt 3 — final try
-    setTimeout(() => attempt("3/3"), C.publishRetry2);
+    attempt(1);
+    setTimeout(() => attempt(2), C.publishRetry1);
+    setTimeout(() => attempt(3), C.publishRetry2);
 
-    // After each attempt the leaderboard modal may appear; close it.
-    // closeOverlay() runs every 400 ms via the setInterval above automatically,
-    // but we also schedule explicit closes in the submit window to be safe.
-    setTimeout(() => closeOverlay(), C.publishRetry1 + 800);
-    setTimeout(() => closeOverlay(), C.publishRetry2 + 800);
+    // Leaderboard modal appears after submit — close it
+    setTimeout(() => closeOverlay(), C.publishRetry1 + 900);
+    setTimeout(() => closeOverlay(), C.publishRetry2 + 900);
   }
 
   function onGameOver() {
     if (S.phase !== "playing") return;
-    S.phase = "over";
+    setPhase("over");
     stopRhythm();
-    S.detectEnabled = false; // pause end-screen detection while we handle this
-    memConsolidate();         // save this run's obstacle log to persistent memory
+    S.detectEnabled = false;
+    memConsolidate();
 
     if (canSubmit()) {
-      setStatus("Game over — submitting in 1s…");
-      // Wait for the END RUN popup to fully render, then run the submit flow.
+      setStatus("Game over — submitting in 1.4s…");
       setTimeout(doPublish, C.publishWait);
-      // Restart 7 s after game-over (gives ~5 s after first submit attempt).
       S.restartTid = setTimeout(() => { S.restartTid = null; doRestart(); }, C.restartDelay);
     } else {
-      // Within 30 s cooldown: let user see score for 2 s, then click SKIP, restart at 5.5 s.
       setStatus("Game over — skipping in 2s…");
-      setTimeout(() => { clickMatching(RE_RESTART); setStatus("Skipped — restarting in 3s…"); }, C.skipClickMs);
+      setTimeout(() => {
+        clickMatching(RE_RESTART);
+        setStatus("Skipped — restarting in 3s…");
+      }, C.skipClickMs);
       S.restartTid = setTimeout(() => { S.restartTid = null; doRestart(); }, C.skipRestartMs);
     }
   }
 
   function doRestart() {
-    S.phase = "restarting";
+    setPhase("restarting");
     setStatus("Restarting…");
     stopRhythm();
     calibrateBg();
-    // Dismiss leaderboard modal or any other overlay before restarting
+    // Dismiss any lingering leaderboard modal before sending start
     closeOverlay();
-    setTimeout(closeOverlay, 300); // second attempt in case modal needs a frame to respond
+    setTimeout(closeOverlay, 350);
     sweepPopups();
 
     setTimeout(() => {
       sendStart();
-      S.jumpCount    = 0;
-      S.startTime    = Date.now();
-      S.lastChangeAt = Date.now();
-      S.prevHash     = 0;
-      S.frame        = 0;
-      S.runLog       = [];     // fresh log for this run
-      S.suppressJumpUntil = 0; // clear any plane suppression from the dead run
-      S.phase        = "playing";
-      memRefresh();            // reload memory (captures pattern count updates)
+      S.jumpCount = 0; S.startTime = Date.now(); S.lastChangeAt = Date.now();
+      S.prevHash = 0; S.frame = 0; S.runLog = []; S.suppressJumpUntil = 0;
+      memRefresh();
+      setPhase("playing");
       setStatus("Running…");
-
-      // Grace period: don't check for end screen for restartGraceMs after restart.
-      // This prevents the leftover SUBMIT/SKIP buttons from the old run
-      // from triggering an immediate false game-over on the new run.
       S.detectEnabled = false;
       setTimeout(() => { S.detectEnabled = true; }, C.restartGraceMs);
     }, 500);
@@ -651,31 +645,45 @@
   /* ══════════════════════════════════════════════════════════════════════════
      BOT CONTROLS
   ══════════════════════════════════════════════════════════════════════════ */
+  async function requestWakeLock() {
+    if ("wakeLock" in navigator) {
+      try { S.wakeLock = await navigator.wakeLock.request("screen"); } catch (_) {}
+    }
+  }
+
   function startBot() {
     if (S.active) return;
-    S.active   = true;
-    S.startTime = Date.now(); S.jumpCount = 0;
-    S.lastChangeAt = Date.now(); S.frame = 0;
-    S.phase    = "playing";
-    S.suppressJumpUntil = 0;
-    S.runLog   = [];
-    memRefresh();      // load persisted patterns from previous sessions
+    S.active = true;
+    S.jumpCount = 0; S.startTime = Date.now(); S.lastChangeAt = Date.now();
+    S.frame = 0; S.runLog = []; S.suppressJumpUntil = 0;
+    memRefresh();
+    setPhase("playing");
+
     if (!S.canvas) findCanvas();
     calibrateBg();
+    findGameObj();
     sendStart();
+    requestWakeLock();
+
     S.rafId    = requestAnimationFrame(tick);
     S.calTimer = setInterval(() => { if (S.active && !S.tainted) calibrateBg(); }, C.calIntervalMs);
 
-    // Heartbeat: safety-net jump every 900 ms.
-    // Only fires when the bot is NOT suppressed (no plane incoming) and
-    // has not jumped recently. Clears ground ice even if pixel scan lags.
+    // Safety-net jump when pixel scan lags (e.g. fast ice after plane suppression)
     S.heartbeatTid = setInterval(() => {
       if (!S.active || S.phase !== "playing") return;
-      if (isSuppressed()) return;                           // plane nearby — stay grounded
+      if (isSuppressed()) return;
       if (Date.now() - S.lastJumpAt > C.heartbeatMs - 20) pressJump();
     }, C.heartbeatMs);
 
-    // Enable end-screen detection after the initial grace period
+    // Watchdog: force-restart if stuck in a non-playing phase too long
+    S.watchdogTid = setInterval(() => {
+      if (!S.active || S.phase === "playing" || S.phase === "idle") return;
+      if (Date.now() - S.phaseAt > C.watchdogMs) {
+        if (S.restartTid) { clearTimeout(S.restartTid); S.restartTid = null; }
+        doRestart();
+      }
+    }, 5_000);
+
     S.detectEnabled = false;
     setTimeout(() => { S.detectEnabled = true; }, C.restartGraceMs);
 
@@ -684,13 +692,15 @@
 
   function stopBot() {
     S.active = false;
-    S.phase  = "idle";
+    setPhase("idle");
     S.detectEnabled = false;
-    if (S.rafId) { cancelAnimationFrame(S.rafId); S.rafId = null; }
-    clearInterval(S.calTimer);
-    clearInterval(S.heartbeatTid); S.heartbeatTid = null;
+    if (S.rafId)        { cancelAnimationFrame(S.rafId); S.rafId = null; }
+    if (S.calTimer)     { clearInterval(S.calTimer);     S.calTimer = null; }
+    if (S.heartbeatTid) { clearInterval(S.heartbeatTid); S.heartbeatTid = null; }
+    if (S.watchdogTid)  { clearInterval(S.watchdogTid);  S.watchdogTid = null; }
+    if (S.restartTid)   { clearTimeout(S.restartTid);    S.restartTid = null; }
     stopRhythm();
-    if (S.restartTid) { clearTimeout(S.restartTid); S.restartTid = null; }
+    if (S.wakeLock)     { S.wakeLock.release().catch(() => {}); S.wakeLock = null; }
     renderBtn(false); setStatus("Idle");
   }
 
@@ -704,30 +714,34 @@
     const mob = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
 
     if (mob) {
-      p.style.cssText = ["position:fixed","bottom:16px","left:50%","transform:translateX(-50%)",
+      p.style.cssText = [
+        "position:fixed","bottom:16px","left:50%","transform:translateX(-50%)",
         "z-index:2147483647","background:rgba(8,10,20,.96)","color:#dde",
         "padding:10px 16px","border-radius:16px","font:12px/1.4 monospace",
         "box-shadow:0 4px 24px rgba(0,0,0,.8)","border:1px solid #2a3060",
-        "display:flex","align-items:center","gap:12px","touch-action:none","max-width:92vw"].join(";");
+        "display:flex","align-items:center","gap:12px","touch-action:none","max-width:92vw",
+      ].join(";");
       p.innerHTML = `
-<div style="display:flex;flex-direction:column;gap:2px">
-  <div id="__rbs__" style="color:#888;font-size:11px;white-space:nowrap">● Idle</div>
+<div style="display:flex;flex-direction:column;gap:2px;flex:1;min-width:0">
+  <div id="__rbs__" style="color:#888;font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">● Idle</div>
   <div id="__rbi__" style="color:#445;font-size:10px;white-space:nowrap">–</div>
 </div>
 <button id="__rbb__" style="padding:11px 22px;cursor:pointer;border:none;border-radius:10px;background:linear-gradient(135deg,#1c8,#0a5);color:#fff;font:700 13px monospace;touch-action:manipulation;min-width:90px;flex-shrink:0">▶ Start</button>`;
     } else {
-      p.style.cssText = ["position:fixed","top:12px","right:12px","z-index:2147483647",
+      p.style.cssText = [
+        "position:fixed","top:12px","right:12px","z-index:2147483647",
         "background:rgba(8,10,18,.93)","color:#dde","padding:14px 16px","border-radius:11px",
-        "font:12px/1.5 monospace","min-width:200px","box-shadow:0 6px 28px rgba(0,0,0,.7)",
-        "border:1px solid #2a3050","backdrop-filter:blur(6px)","user-select:none"].join(";");
+        "font:12px/1.5 monospace","min-width:210px","box-shadow:0 6px 28px rgba(0,0,0,.7)",
+        "border:1px solid #2a3050","backdrop-filter:blur(6px)","user-select:none",
+      ].join(";");
       p.innerHTML = `
-<div id="__rbh__" style="font-size:14px;font-weight:700;color:#7af;margin-bottom:10px;cursor:move;letter-spacing:.4px">⚡ Runner Bot v2.7</div>
+<div id="__rbh__" style="font-size:14px;font-weight:700;color:#7af;margin-bottom:10px;cursor:move;letter-spacing:.4px">⚡ Runner Bot v3.0</div>
 <div id="__rbs__" style="color:#888;margin-bottom:5px">● Idle</div>
 <div id="__rbi__" style="color:#444;font-size:10px;margin-bottom:10px">Searching for canvas…</div>
 <button id="__rbb__" style="width:100%;padding:8px 0;cursor:pointer;border:none;border-radius:7px;background:linear-gradient(135deg,#1c8,#0a5);color:#fff;font:700 12px monospace">▶  Start Bot</button>
 <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between">
-  <span style="color:#333;font-size:10px">ice→jump · plane→stay · learns map ✧</span>
-  <button id="__rbr__" style="padding:2px 7px;font:10px monospace;border:1px solid #2a3050;border-radius:4px;background:#0e1020;color:#556;cursor:pointer" title="Clear learned patterns">✕ mem</button>
+  <span style="color:#333;font-size:10px">ice↑ · plane✈ · learns map · submit ✓</span>
+  <button id="__rbr__" style="padding:2px 8px;font:10px monospace;border:1px solid #2a3050;border-radius:4px;background:#0e1020;color:#556;cursor:pointer" title="Clear learned patterns — tap twice">✕ mem</button>
 </div>`;
     }
 
@@ -741,29 +755,53 @@
     S.btn.addEventListener("click",    doToggle);
     S.btn.addEventListener("touchend", doToggle, { passive: false });
 
+    // Reset learned patterns — requires two taps within 2 s.
+    // (window.confirm is overridden to always return true, so we can't use it.)
     const resetBtn = p.querySelector("#__rbr__");
     if (resetBtn) {
+      let pendingAt = 0;
       resetBtn.addEventListener("click", e => {
         e.stopPropagation();
-        if (confirm("Clear all learned patterns? The bot will re-learn from the next run.")) memReset();
+        const now = Date.now();
+        if (now - pendingAt < 2000) {
+          memReset();
+          resetBtn.textContent = "✓ cleared";
+          setTimeout(() => { resetBtn.textContent = "✕ mem"; }, 1500);
+          pendingAt = 0;
+        } else {
+          pendingAt = now;
+          resetBtn.textContent = "tap again";
+          setTimeout(() => { if (Date.now() - pendingAt >= 1900) resetBtn.textContent = "✕ mem"; }, 2000);
+        }
       });
     }
 
-    // Touch drag
-    let sx=0,sy=0,sl=0,st=0,drag=false;
-    p.addEventListener("touchstart", e => { if (e.target===S.btn) return; drag=true; const t=e.touches[0]; sx=t.clientX; sy=t.clientY; const r=p.getBoundingClientRect(); sl=r.left; st=r.top; }, { passive: true });
-    p.addEventListener("touchmove",  e => { if (!drag||e.target===S.btn) return; e.preventDefault(); const t=e.touches[0]; p.style.left=(sl+t.clientX-sx)+"px"; p.style.top=(st+t.clientY-sy)+"px"; p.style.bottom="auto"; p.style.right="auto"; p.style.transform="none"; }, { passive: false });
-    p.addEventListener("touchend",   () => { drag=false; }, { passive: true });
+    // Touch drag (mobile repositioning)
+    let sx = 0, sy = 0, sl = 0, st = 0, drag = false;
+    p.addEventListener("touchstart", e => {
+      if (e.target === S.btn) return;
+      drag = true; const t = e.touches[0]; sx = t.clientX; sy = t.clientY;
+      const r = p.getBoundingClientRect(); sl = r.left; st = r.top;
+    }, { passive: true });
+    p.addEventListener("touchmove", e => {
+      if (!drag || e.target === S.btn) return; e.preventDefault();
+      const t = e.touches[0];
+      p.style.left = (sl + t.clientX - sx) + "px"; p.style.top = (st + t.clientY - sy) + "px";
+      p.style.bottom = "auto"; p.style.right = "auto"; p.style.transform = "none";
+    }, { passive: false });
+    p.addEventListener("touchend", () => { drag = false; }, { passive: true });
 
+    // Mouse drag (desktop repositioning)
     const head = p.querySelector("#__rbh__");
     if (head) {
-      let ox=0,oy=0,mx=0,my=0;
+      let ox = 0, oy = 0, mx = 0, my = 0;
       head.addEventListener("mousedown", e => {
         e.preventDefault();
-        ox=p.offsetLeft||(innerWidth-12-p.offsetWidth); oy=p.offsetTop; mx=e.clientX; my=e.clientY;
-        const onM = e2 => { p.style.left=(ox+e2.clientX-mx)+"px"; p.style.top=(oy+e2.clientY-my)+"px"; p.style.right="auto"; };
-        const onU = () => { removeEventListener("mousemove",onM); removeEventListener("mouseup",onU); };
-        addEventListener("mousemove",onM); addEventListener("mouseup",onU);
+        ox = p.offsetLeft || (innerWidth - 12 - p.offsetWidth); oy = p.offsetTop;
+        mx = e.clientX; my = e.clientY;
+        const onM = e2 => { p.style.left = (ox + e2.clientX - mx) + "px"; p.style.top = (oy + e2.clientY - my) + "px"; p.style.right = "auto"; };
+        const onU = () => { removeEventListener("mousemove", onM); removeEventListener("mouseup", onU); };
+        addEventListener("mousemove", onM); addEventListener("mouseup", onU);
       });
     }
   }
@@ -771,51 +809,83 @@
   function renderBtn(running) {
     if (!S.btn) return;
     const mob = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
-    S.btn.textContent = running ? (mob ? "■ Stop" : "■  Stop Bot") : (mob ? "▶ Start" : "▶  Start Bot");
+    S.btn.textContent   = running ? (mob ? "■ Stop" : "■  Stop Bot") : (mob ? "▶ Start" : "▶  Start Bot");
     S.btn.style.background = running ? "linear-gradient(135deg,#c33,#911)" : "linear-gradient(135deg,#1c8,#0a5)";
   }
 
   function setStatus(msg) {
     if (!S.statusEl) return;
-    const col = msg.includes("Run") ? "#4e4" : (msg.includes("over")||msg.includes("Submit")||msg.includes("skip")) ? "#fa4" : "#888";
+    const col =
+      /running/i.test(msg)              ? "#4e4" :   // green  — playing
+      /submitted|✓/i.test(msg)          ? "#4af" :   // blue   — score saved
+      /submitting|game over/i.test(msg) ? "#fa4" :   // amber  — transitioning
+      /skip|restart/i.test(msg)         ? "#c8f" :   // purple — restarting
+      "#888";                                          // grey   — idle/other
     S.statusEl.innerHTML = `<span style="color:${col}">● ${msg}</span>`;
   }
 
   function updateStatus() {
     if (!S.active || S.phase !== "playing") return;
     const sec  = (Date.now() - S.startTime) / 1000 | 0;
-    const time = String(sec / 60 | 0).padStart(2,"0") + ":" + String(sec % 60).padStart(2,"0");
+    const mm   = String(sec / 60 | 0).padStart(2, "0");
+    const ss   = String(sec % 60).padStart(2, "0");
     const sup  = isSuppressed() ? " ✈" : "";
     const runs = memRunCount();
-    const memStr = runs > 0
-      ? (runs < RUNS_MIN ? ` · learn ${runs}/${RUNS_MIN}` : ` · ✧${runs}r`)
-      : "";
-    setStatus(`Running ${time} · ${S.jumpCount}j${sup}${memStr}`);
+    const mem  = runs > 0 ? (runs < RUNS_MIN ? ` · learn ${runs}/${RUNS_MIN}` : ` · ✧${runs}r`) : "";
+    setStatus(`Running ${mm}:${ss} · ${S.jumpCount}j${sup}${mem}`);
   }
 
   function updateInfo() {
     if (!S.infoEl) return;
-    const pats = memPatternCount();
-    const runs = memRunCount();
-    const memStr = pats > 0
-      ? ` · ${pats}pat/${runs}r`
-      : (runs > 0 ? ` · learning…` : "");
-    if (!S.canvas) { S.infoEl.textContent = `Searching…${memStr}`; return; }
-    S.infoEl.textContent = S.tainted
-      ? `rhythm mode${memStr}`
-      : `${S.canvas.width}×${S.canvas.height}${memStr}`;
+    const pats = memPatternCount(), runs = memRunCount();
+    const mem  = pats > 0 ? ` · ${pats}pat/${runs}r` : runs > 0 ? " · learning…" : "";
+    const base = !S.canvas ? "canvas not found" : S.tainted ? "rhythm mode" : `${S.canvas.width}×${S.canvas.height}`;
+    S.infoEl.textContent = base + mem;
   }
 
-  /* ── canvas watcher ─────────────────────────────────────────────────────── */
-  new MutationObserver(() => { if (!S.canvas && findCanvas()) { calibrateBg(); updateInfo(); } })
-    .observe(document.documentElement, { childList: true, subtree: true });
+  /* ══════════════════════════════════════════════════════════════════════════
+     EVENT OBSERVERS
+  ══════════════════════════════════════════════════════════════════════════ */
 
-  /* ── global toggle ──────────────────────────────────────────────────────── */
+  // Watch for new canvas elements added dynamically after page load
+  new MutationObserver(() => {
+    if (!S.canvas && findCanvas()) { calibrateBg(); updateInfo(); }
+  }).observe(document.documentElement, { childList: true, subtree: true });
+
+  // Auto-dismiss popups when not actively playing or managing game-over.
+  // Guard excludes "playing" (never click during a run) and "over" (doPublish
+  // owns the submission flow — no outside interference allowed).
+  new MutationObserver(() => {
+    if (!S.active || S.phase === "playing" || S.phase === "over") return;
+    sweepPopups();
+  }).observe(document.documentElement, { childList: true, subtree: true });
+
+  setInterval(() => {
+    if (!S.active || S.phase === "playing" || S.phase === "over") return;
+    sweepPopups();
+  }, 400);
+
+  setInterval(detectEndScreen, 300);
+
+  // Prevent false game-over when tab is backgrounded (rAF pauses → canvas hash
+  // stops changing → the 2000 ms threshold would fire). Reset hash state on
+  // any visibility change so the timer starts fresh when the tab returns.
+  document.addEventListener("visibilitychange", () => {
+    S.lastChangeAt = Date.now();
+    S.prevHash = 0;
+    // Re-acquire wake lock after iOS releases it on tab hide
+    if (!document.hidden && S.active && !S.wakeLock) requestWakeLock();
+  });
+
+  /* ── global toggle (bookmarklet / external call) ─────────────────────── */
   window.__RB_ACTIVE__ = false;
-  window.__RB_TOGGLE__ = () => { window.__RB_ACTIVE__ = !window.__RB_ACTIVE__; window.__RB_ACTIVE__ ? startBot() : stopBot(); };
+  window.__RB_TOGGLE__ = () => {
+    window.__RB_ACTIVE__ = !window.__RB_ACTIVE__;
+    window.__RB_ACTIVE__ ? startBot() : stopBot();
+  };
 
   /* ══════════════════════════════════════════════════════════════════════════
-     INIT  –  auto-start 2.5 s after page load
+     INIT — create panel, find canvas, auto-start 2.5 s after page load
   ══════════════════════════════════════════════════════════════════════════ */
   function init() {
     createPanel();
@@ -824,5 +894,7 @@
     setTimeout(() => { if (!S.active) startBot(); }, 2500);
   }
 
-  document.readyState === "loading" ? document.addEventListener("DOMContentLoaded", init) : init();
+  document.readyState === "loading"
+    ? document.addEventListener("DOMContentLoaded", init)
+    : init();
 })();
