@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Iceman Runner Bot
 // @namespace    https://github.com/believeinmeme/token-list
-// @version      2.6.0
-// @description  Learns the obstacle map over runs and anticipates obstacles from memory. Dual-zone pixel scan, adaptive speed, smart 30s submit/skip. Hands-free.
+// @version      2.7.0
+// @description  Learns the obstacle map over runs and anticipates obstacles from memory. Dual-zone pixel scan, adaptive speed, reliable leaderboard submit. Hands-free.
 // @author       believeinmeme
 // @match        https://www.icemancountdown.com/runner*
 // @match        https://www.icemancountdown.com/runner
@@ -44,8 +44,11 @@
   window.alert   = () => undefined;
   window.prompt  = (_, def) => (def !== undefined ? def : "");
 
-  const RE_PUBLISH = /^\s*submit\s*$|publish|submit[\s\S]{0,20}score|leaderboard/i;
-  const RE_APPROVE = /\b(ok|yes|confirm|accept|continue|got.?it|done|send|save|close)\b/i;
+  // RE_PUBLISH must NOT match "leaderboard" — that opens the leaderboard modal,
+  // it does NOT submit the score, and clicking it gets the bot stuck.
+  const RE_PUBLISH = /^\s*submit\s*$|^\s*publish\s*$|submit[\s\S]{0,20}score/i;
+  const RE_CLOSE   = /^\s*(close|dismiss|done|got.?it)\s*$/i;  // leaderboard modal close
+  const RE_APPROVE = /\b(ok|yes|confirm|accept|continue|send|save)\b/i;
   const RE_RESTART = /^\s*skip\s*$|play.?again|try.?again|restart|new.?game|retry/i;
 
   function elVisible(el) {
@@ -74,7 +77,25 @@
     });
   }
 
+  // Dismiss the "LEADERBOARD Loading…" modal (and any similar overlay).
+  // Uses a broader selector than clickMatching() because the CLOSE button is
+  // sometimes a <div> or <a> rather than a <button>.
+  function closeOverlay() {
+    // Try standard button elements first
+    if (clickMatching(RE_CLOSE)) return true;
+    // Fall back to any visible leaf element whose text is exactly "CLOSE" / "DONE" etc.
+    for (const el of document.querySelectorAll('*:not(#__rb__ *)')) {
+      if (!elVisible(el)) continue;
+      if (el.children.length > 0) continue; // skip containers
+      const txt = (el.textContent || "").trim();
+      if (RE_CLOSE.test(txt)) { el.click(); return true; }
+    }
+    return false;
+  }
+
   function sweepPopups() {
+    // Priority order: close any leaderboard modal → tick checkbox → submit → approve → restart
+    closeOverlay();
     checkAllCheckboxes();
     setTimeout(() => { clickMatching(RE_PUBLISH) || clickMatching(RE_APPROVE) || clickMatching(RE_RESTART); }, 150);
   }
@@ -120,10 +141,13 @@
     heartbeatMs:   850,   // ms – safety-net jump interval (only when NOT suppressed)
 
     // ── game loop ─────────────────────────────────────────────────────────
-    gameOverMs:   1800,   // ms of canvas silence → game-over
-    publishWait:  1000,   // ms after game-over before clicking SUBMIT
-    restartDelay: 3800,   // ms after game-over before restart (submit path)
-    skipRestartMs: 800,   // ms after game-over before restart (skip path)
+    gameOverMs:    1800,  // ms of canvas silence → game-over
+    publishWait:   1300,  // ms after game-over before first SUBMIT attempt (popup load time)
+    publishRetry1: 1800,  // ms after first attempt before retry
+    publishRetry2: 3200,  // ms after first attempt before final retry
+    restartDelay:  7000,  // ms total from game-over to restart (submit path)
+    skipClickMs:   2200,  // ms after game-over before clicking SKIP (let user see score)
+    skipRestartMs: 5500,  // ms total from game-over to restart (skip path)
     restartGraceMs:3500,  // ms after restart where end-screen detection is paused
     calIntervalMs: 8000,
 
@@ -544,6 +568,34 @@
   ══════════════════════════════════════════════════════════════════════════ */
   function canSubmit() { return Date.now() - S.lastPublishedAt >= PUBLISH_COOLDOWN_MS; }
 
+  // Dedicated submit flow: tick checkbox → click SUBMIT → retry twice → close leaderboard.
+  // Called C.publishWait ms after game-over (gives popup time to fully render).
+  function doPublish() {
+    S.phase = "publishing";
+    S.lastPublishedAt = Date.now(); // start cooldown now so we don't double-submit
+
+    function attempt(label) {
+      checkAllCheckboxes();
+      setTimeout(() => {
+        const ok = clickMatching(RE_PUBLISH);
+        setStatus(ok ? `Submitted ✓ (${label}) — restarting in 5s…` : `Waiting for SUBMIT… (${label})`);
+      }, 350);
+    }
+
+    // Attempt 1 — immediately after publishWait
+    attempt("1/3");
+    // Attempt 2 — 1.8 s later in case form needed more time / checkbox state propagation
+    setTimeout(() => attempt("2/3"), C.publishRetry1);
+    // Attempt 3 — final try
+    setTimeout(() => attempt("3/3"), C.publishRetry2);
+
+    // After each attempt the leaderboard modal may appear; close it.
+    // closeOverlay() runs every 400 ms via the setInterval above automatically,
+    // but we also schedule explicit closes in the submit window to be safe.
+    setTimeout(() => closeOverlay(), C.publishRetry1 + 800);
+    setTimeout(() => closeOverlay(), C.publishRetry2 + 800);
+  }
+
   function onGameOver() {
     if (S.phase !== "playing") return;
     S.phase = "over";
@@ -552,18 +604,15 @@
     memConsolidate();         // save this run's obstacle log to persistent memory
 
     if (canSubmit()) {
-      setStatus("Game over – submitting score…");
-      setTimeout(() => {
-        S.phase = "publishing";
-        sweepPopups();             // tick checkbox → then SUBMIT
-        S.lastPublishedAt = Date.now();
-        setStatus("Submitted ✓ – restarting…");
-      }, C.publishWait);
+      setStatus("Game over — submitting in 1s…");
+      // Wait for the END RUN popup to fully render, then run the submit flow.
+      setTimeout(doPublish, C.publishWait);
+      // Restart 7 s after game-over (gives ~5 s after first submit attempt).
       S.restartTid = setTimeout(() => { S.restartTid = null; doRestart(); }, C.restartDelay);
     } else {
-      // Still within 30 s cooldown → skip immediately, restart fast
-      setStatus("Game over – cooldown, skipping…");
-      clickMatching(RE_RESTART); // click SKIP
+      // Within 30 s cooldown: let user see score for 2 s, then click SKIP, restart at 5.5 s.
+      setStatus("Game over — skipping in 2s…");
+      setTimeout(() => { clickMatching(RE_RESTART); setStatus("Skipped — restarting in 3s…"); }, C.skipClickMs);
       S.restartTid = setTimeout(() => { S.restartTid = null; doRestart(); }, C.skipRestartMs);
     }
   }
@@ -573,7 +622,10 @@
     setStatus("Restarting…");
     stopRhythm();
     calibrateBg();
-    sweepPopups(); // clear any remaining overlay before restarting
+    // Dismiss leaderboard modal or any other overlay before restarting
+    closeOverlay();
+    setTimeout(closeOverlay, 300); // second attempt in case modal needs a frame to respond
+    sweepPopups();
 
     setTimeout(() => {
       sendStart();
@@ -669,7 +721,7 @@
         "font:12px/1.5 monospace","min-width:200px","box-shadow:0 6px 28px rgba(0,0,0,.7)",
         "border:1px solid #2a3050","backdrop-filter:blur(6px)","user-select:none"].join(";");
       p.innerHTML = `
-<div id="__rbh__" style="font-size:14px;font-weight:700;color:#7af;margin-bottom:10px;cursor:move;letter-spacing:.4px">⚡ Runner Bot v2.6</div>
+<div id="__rbh__" style="font-size:14px;font-weight:700;color:#7af;margin-bottom:10px;cursor:move;letter-spacing:.4px">⚡ Runner Bot v2.7</div>
 <div id="__rbs__" style="color:#888;margin-bottom:5px">● Idle</div>
 <div id="__rbi__" style="color:#444;font-size:10px;margin-bottom:10px">Searching for canvas…</div>
 <button id="__rbb__" style="width:100%;padding:8px 0;cursor:pointer;border:none;border-radius:7px;background:linear-gradient(135deg,#1c8,#0a5);color:#fff;font:700 12px monospace">▶  Start Bot</button>
