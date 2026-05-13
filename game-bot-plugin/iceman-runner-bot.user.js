@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Iceman Runner Bot
 // @namespace    https://github.com/believeinmeme/token-list
-// @version      2.2.0
-// @description  Auto-plays indefinitely. Tuned jumps, auto-ticks checkbox, auto-submits end-run form, hands-free loop.
+// @version      2.3.0
+// @description  Heartbeat-jump strategy (never stops jumping), smart 30s submit/skip, fully hands-free.
 // @author       believeinmeme
 // @match        https://www.icemancountdown.com/runner*
 // @match        https://www.icemancountdown.com/runner
@@ -89,8 +89,9 @@
   new MutationObserver(() => sweepPopups())
     .observe(document.documentElement, { childList: true, subtree: true });
 
-  // Periodic fallback every 350 ms (catches CSS-shown popups, not DOM-added ones)
-  setInterval(sweepPopups, 350);
+  // Periodic fallback every 350 ms — only outside active gameplay to avoid
+  // accidentally clicking game-UI buttons while the player is running.
+  setInterval(() => { if (!S.active || S.phase !== "playing") sweepPopups(); }, 350);
 
 
   /* ══════════════════════════════════════════════════════════════════════════
@@ -99,13 +100,12 @@
   const S = {
     active: false, canvas: null, ctx: null,
     bg: null, tainted: false,
-    rafId: null, calTimer: null, restartTid: null, rhythmTid: null,
+    rafId: null, calTimer: null, restartTid: null, rhythmTid: null, heartbeatTid: null,
     lastJumpAt: 0, lastDuckAt: 0,
     jumpCount: 0, startTime: 0,
     lastChangeAt: 0, prevHash: 0,
     frame: 0, gameObj: null,
     panel: null, statusEl: null, infoEl: null, btn: null,
-    // game-loop phase
     phase: "idle",  // "idle" | "playing" | "over" | "publishing" | "restarting"
     lastPublishedAt: 0,
   };
@@ -117,29 +117,33 @@
   ══════════════════════════════════════════════════════════════════════════ */
   const C = {
     // ── jump timing ──────────────────────────────────────────────────────
-    jumpCooldown:  550,   // ms min between jumps  (was 380 → less spam)
-    duckCooldown:  350,
-    jumpAirMs:     750,   // estimated jump arc    (was 620 → more air-time guard)
-    duckHoldMs:    260,
+    jumpCooldown:  400,   // ms min between jumps — tighter so heartbeat fires reliably
+    duckCooldown:  300,
+    jumpAirMs:     650,   // estimated jump arc
+    duckHoldMs:    240,
+    heartbeatMs:   820,   // guaranteed jump every 820 ms if no recent jump
+                          // → bot clears virtually all ground obstacles even when
+                          //   pixel scan misses them (tainted canvas / bad thresholds)
     // ── game loop ─────────────────────────────────────────────────────────
     gameOverMs:   1800,   // ms of canvas silence → game-over
-    publishWait:  1200,   // ms after game-over before clicking publish
-    restartDelay: 4000,   // ms after game-over before sending restart inputs
+    publishWait:  1000,   // ms after game-over before clicking SUBMIT
+    restartDelay: 3800,   // ms after game-over before restart (when submitting)
+    skipRestartMs: 700,   // ms after game-over before restart (when skipping)
     calIntervalMs:8000,
-    // ── pixel detection  ──  RAISED to cut false positives ───────────────
-    bgTol:          65,   // Manhattan-distance threshold  (tuned: 55 caused spam, 75 caused 0 jumps)
-    obstacleHits:    5,   // ground zone: min pixel count
-    airExtraHits:    6,   // extra count needed for duck
+    // ── pixel detection ───────────────────────────────────────────────────
+    bgTol:          60,   // Manhattan-distance threshold
+    obstacleHits:    4,   // ground zone: min pixels to call it an obstacle
+    airExtraHits:    5,   // extra pixels needed to trigger duck
     hashEvery:       3,
-    // ── scan geometry ────────────────────────────────────────────────────
-    groundTop: 0.58, groundBot: 0.85,
-    airTop:    0.28, airBot:    0.58,
-    baseCols: [0.27, 0.34, 0.42],
-    colPushPer30s: 0.025, colPushMax: 0.12, colMax: 0.60,
+    // ── scan geometry — 4 columns, starting closer to player ─────────────
+    groundTop: 0.52, groundBot: 0.88,  // wider vertical range
+    airTop:    0.26, airBot:    0.56,
+    baseCols: [0.22, 0.30, 0.38, 0.47],  // 4 columns, shifted right as game speeds up
+    colPushPer30s: 0.02, colPushMax: 0.10, colMax: 0.62,
     // ── rhythm fallback (tainted canvas / iOS) ────────────────────────────
-    rhythmBase:   1400,   // ms starting interval  (was 880 → far more conservative)
-    rhythmMinMs:   700,   // ms floor              (was 380)
-    rhythmStep:     35,
+    rhythmBase:    820,   // mirrors heartbeatMs — rhythm IS the heartbeat when tainted
+    rhythmMinMs:   450,
+    rhythmStep:     30,
     rhythmEvery:    20,
   };
 
@@ -369,30 +373,35 @@
      GAME LOOP STATE MACHINE
      playing → over → publishing → restarting → playing
   ══════════════════════════════════════════════════════════════════════════ */
+  function canSubmit() {
+    return Date.now() - S.lastPublishedAt >= PUBLISH_COOLDOWN_MS;
+  }
+
   function onGameOver(){
-    if(S.phase!=="playing") return; // already handling
+    if(S.phase!=="playing") return;
     S.phase="over";
     stopRhythm();
-    setStatus("Game over – submitting score…");
 
-    // Step 1 (immediate): tick checkbox + click SUBMIT.
-    // sweepPopups() checks checkboxes first, then clicks SUBMIT after 150 ms.
-    sweepPopups();
-
-    // Step 2 (1.2 s): second attempt in case the form wasn't fully rendered yet.
-    setTimeout(()=>{
-      S.phase="publishing";
-      setStatus("Publishing score…");
-      sweepPopups();
-      S.lastPublishedAt=Date.now();
-    }, C.publishWait);
-
-    // Step 3 (4 s total): restart regardless of whether submit worked.
-    if(S.restartTid) return;
-    S.restartTid=setTimeout(()=>{
-      S.restartTid=null;
-      doRestart();
-    }, C.restartDelay);
+    if(canSubmit()){
+      // ── SUBMIT path ───────────────────────────────────────────────────
+      // Cooldown has passed → tick checkbox then click SUBMIT.
+      setStatus("Game over – submitting score…");
+      setTimeout(()=>{
+        S.phase="publishing";
+        sweepPopups();             // tick checkbox → then SUBMIT after 150 ms
+        S.lastPublishedAt=Date.now();
+        setStatus("Score submitted ✓ – restarting…");
+      }, C.publishWait);
+      // Give time for submission to process, then restart.
+      S.restartTid=setTimeout(()=>{ S.restartTid=null; doRestart(); }, C.restartDelay);
+    } else {
+      // ── SKIP path ─────────────────────────────────────────────────────
+      // Still within the 30 s cooldown → click SKIP immediately and
+      // restart as fast as possible to get a better score before next submit.
+      setStatus("Game over – skipping (cooldown) – restarting fast…");
+      clickMatching(RE_RESTART);   // click SKIP
+      S.restartTid=setTimeout(()=>{ S.restartTid=null; doRestart(); }, C.skipRestartMs);
+    }
   }
 
   function doRestart(){
@@ -428,6 +437,18 @@
     sendStart();
     S.rafId=requestAnimationFrame(tick);
     S.calTimer=setInterval(()=>{if(S.active&&!S.tainted)calibrateBg();},C.calIntervalMs);
+
+    // ── heartbeat jump ────────────────────────────────────────────────────
+    // Fires every heartbeatMs. If no jump has happened recently (pixel scan
+    // missed the obstacle, canvas tainted, etc.) it forces a jump.
+    // This is the "jump over everything" safety net — the bot will never
+    // stop jumping for more than ~820 ms regardless of detection quality.
+    S.heartbeatTid=setInterval(()=>{
+      if(S.active && S.phase==="playing" && Date.now()-S.lastJumpAt > C.heartbeatMs-20){
+        pressJump();
+      }
+    }, C.heartbeatMs);
+
     renderBtn(true); updateInfo(); setStatus("Running…");
   }
 
@@ -435,7 +456,9 @@
     S.active=false;
     S.phase="idle";
     if(S.rafId){cancelAnimationFrame(S.rafId);S.rafId=null;}
-    clearInterval(S.calTimer); stopRhythm();
+    clearInterval(S.calTimer);
+    clearInterval(S.heartbeatTid); S.heartbeatTid=null;
+    stopRhythm();
     if(S.restartTid){clearTimeout(S.restartTid);S.restartTid=null;}
     renderBtn(false); setStatus("Idle");
   }
@@ -472,8 +495,7 @@
 <div id="__rbi__" style="color:#444;font-size:10px;margin-bottom:10px">Searching for canvas…</div>
 <button id="__rbb__" style="width:100%;padding:8px 0;cursor:pointer;border:none;border-radius:7px;background:linear-gradient(135deg,#1c8,#0a5);color:#fff;font:700 12px monospace">▶  Start Bot</button>
 <div style="margin-top:10px;color:#333;font-size:10px;line-height:1.8">
-  Auto-start · publish score · auto-approve<br>
-  conservative jumps · hands-free ✓
+  heartbeat jump · 30s submit/skip · hands-free ✓
 </div>`;
     }
 
