@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Iceman Runner Bot
 // @namespace    https://github.com/believeinmeme/token-list
-// @version      3.0.0
-// @description  Self-learning runner bot. Dual-zone pixel scan + memory anticipation + adaptive speed + reliable leaderboard submit. Fully hands-free.
+// @version      3.1.0
+// @description  Self-learning runner bot. Fixed ground calibration, faster reaction, earlier learning. Dual-zone pixel scan, memory anticipation, hands-free.
 // @author       believeinmeme
 // @match        https://www.icemancountdown.com/runner*
 // @run-at       document-idle
@@ -13,7 +13,7 @@
 // ==/UserScript==
 
 /**
- * Iceman Runner Bot v3.0 — final release
+ * Iceman Runner Bot v3.1 — learning fix + faster reactions
  *
  * OBSTACLE RECOGNITION
  *   Ground ice  → jump    (lower canvas zone, vs ground-bg colour)
@@ -21,16 +21,23 @@
  *   Independent background calibrations for each zone — ice-vs-ground
  *   and plane-vs-sky are measured correctly, not conflated.
  *
- * LEARNING SYSTEM
- *   Every pixel-scan detection is time-stamped into localStorage by
- *   300 ms bucket. After 3 training runs, patterns with ≥60% confidence
- *   (jump) or ≥72% (duck) are anticipated 500 ms before the scan sees
- *   them. Memory sharpens with every run and survives page reloads.
+ * LEARNING SYSTEM (v3.1 fixes)
+ *   Ground calibration now samples x=14% (clear ground between the
+ *   player sprite at ~10% and the first scan column at 28%).  The v3.0
+ *   sample at x=2% landed on the player and contaminated bgGnd, so
+ *   isGndObs() never fired and no obstacle data was ever logged.
+ *   After 2 training runs (was 3), patterns with ≥55% confidence
+ *   (jump, was 60%) or ≥72% (duck) are anticipated 700 ms early (was 500).
+ *
+ * FASTER REACTIONS (v3.1)
+ *   Jump cooldown: 300 ms (was 380).  Heartbeat: 650 ms (was 850).
+ *   Extra close-range scan column at x=0.16 for last-second obstacles.
+ *   bgTolGnd tightened to 40 (was 55). groundHits: 2 (was 4). airHits: 8.
  *
  * ADAPTIVE SPEED
  *   Scan columns shift right every 30 s (longer look-ahead as speed rises).
  *   Plane-suppression window shrinks from ~1100 ms → 480 ms over 2 min.
- *   Heartbeat safety-net jump every 850 ms, respects plane suppression.
+ *   Heartbeat safety-net jump every 650 ms, respects plane suppression.
  *
  * SUBMISSION FLOW
  *   Game-over → tick T&C checkbox → click SUBMIT (3 retries over 3.4 s).
@@ -38,17 +45,13 @@
  *   Leaderboard modal (CLOSE button) dismissed automatically after submit.
  *   7.5 s total before next run; 5.5 s on the skip path.
  *
- * RELIABILITY ADDITIONS (v3.0)
+ * RELIABILITY (carried from v3.0)
  *   • Screen Wake Lock  — prevents iOS from sleeping mid-run.
- *   • Visibility guard  — resets canvas hash when tab is backgrounded
- *                         so a tab-switch never triggers a false game-over.
- *   • Watchdog timer    — if stuck outside "playing" phase for > 12 s,
- *                         force-restarts the bot.
+ *   • Visibility guard  — resets canvas hash when tab is backgrounded.
+ *   • Watchdog timer    — force-restarts if stuck > 12 s outside "playing".
  *   • Phase timestamps  — atomic setPhase() keeps the watchdog accurate.
- *   • sweepPopups guard — excluded from "over" phase so doPublish() has
- *                         exclusive control of the submission flow.
- *   • memReset double-tap — confirm() is overridden to true game-wide,
- *                           so reset requires two taps within 2 s.
+ *   • sweepPopups guard — excluded from "over" phase so doPublish() owns submit.
+ *   • memReset double-tap — requires two taps within 2 s (confirm() overridden).
  */
 (function () {
   "use strict";
@@ -104,11 +107,11 @@
   ══════════════════════════════════════════════════════════════════════════ */
   const C = {
     // jump / duck
-    jumpCooldown:  380,   // min ms between jumps
+    jumpCooldown:  300,   // min ms between jumps
     duckCooldown:  280,
     jumpAirMs:     620,   // estimated air time (prevents double-jump)
     duckHoldMs:    220,
-    heartbeatMs:   850,   // safety-net jump when no obstacle detected
+    heartbeatMs:   650,   // safety-net jump when no obstacle detected
 
     // game loop
     gameOverMs:   2000,   // ms canvas must freeze before declaring game-over
@@ -123,10 +126,10 @@
     watchdogMs:  12_000,  // max ms allowed outside "playing" before force-restart
 
     // pixel detection
-    bgTolGnd:      55,    // colour-distance threshold — ice vs ground
+    bgTolGnd:      40,    // colour-distance threshold — ice vs ground
     bgTolAir:      60,    // colour-distance threshold — plane vs sky
-    groundHits:     4,    // min differing pixels to confirm ice
-    airHits:       10,    // min differing pixels to confirm plane (high: avoids city-bg noise)
+    groundHits:     2,    // min differing pixels to confirm ice
+    airHits:        8,    // min differing pixels to confirm plane
     hashEvery:      4,    // check canvas hash every N frames
 
     // scan zones (fraction of canvas height)
@@ -134,7 +137,8 @@
     airTop:    0.24, airBot:    0.55,   // plane zone (non-overlapping)
 
     // scan columns (fraction of canvas width) — pushed right as speed rises
-    baseCols: [0.28, 0.40, 0.52, 0.64],
+    // 0.16 = close-range safety column just ahead of the player (~10% x)
+    baseCols: [0.16, 0.28, 0.40, 0.52, 0.64],
     colPushPer30s: 0.04, colPushMax: 0.16, colMax: 0.80,
 
     // rhythm fallback (tainted canvas)
@@ -266,10 +270,12 @@
         Math.max(2, cv.width * 0.07 | 0),
         Math.max(2, cv.height * 0.07 | 0)));
     } catch (_) { S.tainted = true; return; }
-    // Ground: far-left at ground level — reference for ice detection
+    // Ground: sampled at x=14% — between player sprite (~10%) and first scan
+    // column at 28%.  Sampling closer to the left edge (x=2%) captures the
+    // player sprite itself, contaminating bgGnd and breaking ice detection.
     try {
       S.bgGnd = avgColor(ctx.getImageData(
-        Math.max(1, cv.width  * 0.02 | 0),
+        Math.max(1, cv.width  * 0.14 | 0),
         Math.max(1, cv.height * C.groundTop | 0),
         Math.max(2, cv.width  * 0.05 | 0),
         Math.max(2, cv.height * (C.groundBot - C.groundTop) | 0)));
@@ -302,10 +308,10 @@
   const MEM_KEY    = "__rb_mem__";
   const MEM_VER    = 2;       // bump if schema changes — old data auto-discarded
   const BUCKET_MS  = 300;
-  const LOOK_AHEAD = 500;
-  const CONF_JUMP  = 0.60;
+  const LOOK_AHEAD = 700;     // anticipate 700 ms early (was 500)
+  const CONF_JUMP  = 0.55;    // confidence threshold for jump (was 0.60)
   const CONF_DUCK  = 0.72;    // higher bar: false duck blocks jumps for ~800 ms
-  const RUNS_MIN   = 3;
+  const RUNS_MIN   = 2;       // training runs before anticipation fires (was 3)
 
   let MEM = null;
   let lastAntBucket = -1;
@@ -735,7 +741,7 @@
         "border:1px solid #2a3050","backdrop-filter:blur(6px)","user-select:none",
       ].join(";");
       p.innerHTML = `
-<div id="__rbh__" style="font-size:14px;font-weight:700;color:#7af;margin-bottom:10px;cursor:move;letter-spacing:.4px">⚡ Runner Bot v3.0</div>
+<div id="__rbh__" style="font-size:14px;font-weight:700;color:#7af;margin-bottom:10px;cursor:move;letter-spacing:.4px">⚡ Runner Bot v3.1</div>
 <div id="__rbs__" style="color:#888;margin-bottom:5px">● Idle</div>
 <div id="__rbi__" style="color:#444;font-size:10px;margin-bottom:10px">Searching for canvas…</div>
 <button id="__rbb__" style="width:100%;padding:8px 0;cursor:pointer;border:none;border-radius:7px;background:linear-gradient(135deg,#1c8,#0a5);color:#fff;font:700 12px monospace">▶  Start Bot</button>
@@ -838,7 +844,10 @@
   function updateInfo() {
     if (!S.infoEl) return;
     const pats = memPatternCount(), runs = memRunCount();
-    const mem  = pats > 0 ? ` · ${pats}pat/${runs}r` : runs > 0 ? " · learning…" : "";
+    // Always show run count so the user can confirm learning is happening
+    const mem = pats > 0
+      ? ` · ${pats}pat/${runs}r`
+      : ` · ${runs}r${runs < RUNS_MIN ? ` (need ${RUNS_MIN})` : ""}`;
     const base = !S.canvas ? "canvas not found" : S.tainted ? "rhythm mode" : `${S.canvas.width}×${S.canvas.height}`;
     S.infoEl.textContent = base + mem;
   }
