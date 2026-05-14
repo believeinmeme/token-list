@@ -1,0 +1,247 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Iceman Runner Bot – iOS Install</title>
+  <style>
+    :root {
+      --bg: #0b0d18; --surface: #121520; --border: #1e2440;
+      --text: #ccd; --muted: #556; --accent: #4af; --green: #1c8; --red: #c33;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: var(--bg); color: var(--text); font: 14px/1.7 system-ui, monospace; padding: 20px 16px 60px; max-width: 680px; margin: 0 auto; }
+    h1 { font-size: 22px; color: var(--accent); margin-bottom: 4px; }
+    .sub { color: var(--muted); font-size: 12px; margin-bottom: 28px; }
+    h2 { font-size: 15px; color: #9cf; margin: 28px 0 10px; }
+    h3 { font-size: 13px; color: #7af; margin: 18px 0 6px; }
+    p  { color: var(--muted); margin-bottom: 10px; font-size: 13px; }
+    strong { color: var(--text); }
+    ol, ul { padding-left: 20px; color: var(--muted); font-size: 13px; line-height: 2; }
+    li strong { color: var(--text); }
+    code { background: #1a1e30; border: 1px solid var(--border); border-radius: 4px; padding: 1px 6px; font-size: 12px; color: #adf; }
+
+    .card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 16px 18px; margin-bottom: 14px; }
+    .badge { display: inline-block; font-size: 10px; padding: 2px 8px; border-radius: 999px; margin-left: 8px; vertical-align: middle; }
+    .badge-easy { background: #0a3; color: #cfc; }
+    .badge-best { background: #06a; color: #adf; }
+    .badge-ext  { background: #444; color: #ccc; }
+
+    .btn {
+      display: inline-block; padding: 10px 20px; border-radius: 9px; border: none;
+      cursor: pointer; font: 700 13px monospace; letter-spacing: .3px;
+      background: linear-gradient(135deg, #1c8, #0a5); color: #fff;
+      text-decoration: none; transition: opacity .15s; margin: 4px 6px 4px 0;
+    }
+    .btn:hover { opacity: .85; }
+    .btn-red   { background: linear-gradient(135deg,#c33,#911); }
+    .btn-blue  { background: linear-gradient(135deg,#28f,#059); }
+    .btn-grey  { background: #2a3050; color: #9af; }
+    .btn:disabled { opacity: .4; cursor: default; }
+
+    #bm-status { font-size: 12px; color: var(--muted); margin-top: 8px; min-height: 18px; }
+    #bm-status.ok  { color: #4e4; }
+    #bm-status.err { color: #fa4; }
+
+    textarea {
+      width: 100%; height: 90px; background: #0d0f1c; border: 1px solid var(--border);
+      border-radius: 8px; color: #89a; font: 11px/1.5 monospace; padding: 10px;
+      resize: vertical; margin-top: 8px;
+    }
+
+    .step-num {
+      display: inline-flex; align-items: center; justify-content: center;
+      width: 22px; height: 22px; border-radius: 50%;
+      background: #1a2040; border: 1px solid #2a3060; color: var(--accent);
+      font-size: 11px; font-weight: 700; flex-shrink: 0; margin-right: 8px;
+    }
+    .step { display: flex; align-items: flex-start; gap: 4px; margin: 8px 0; font-size: 13px; color: var(--muted); }
+    .step strong { color: var(--text); }
+
+    .divider { border: none; border-top: 1px solid var(--border); margin: 24px 0; }
+    .note { background: #0e1020; border-left: 3px solid #2a3; border-radius: 0 8px 8px 0; padding: 10px 14px; font-size: 12px; color: #6a9; margin: 12px 0; }
+    .warn { border-left-color: #a60; color: #ca8; background: #100e00; }
+  </style>
+</head>
+<body>
+
+<h1>⚡ Iceman Runner Bot</h1>
+<p class="sub">v2.0 · iOS &amp; mobile optimised · jump + duck · adaptive · auto-restart</p>
+
+<!-- ═══════════════════════════════════════════════════════════════════════
+     OPTION A – BOOKMARKLET
+     ═══════════════════════════════════════════════════════════════════════ -->
+<h2>Option A — Bookmarklet <span class="badge badge-easy">No app needed</span></h2>
+<p>Works on <strong>iOS Safari</strong>, <strong>Chrome iOS</strong>, and any desktop browser. Tap the bookmark whenever you want the bot to appear. Tap it again to toggle it off.</p>
+
+<div class="card">
+  <h3>Step 1 — Get the bookmarklet code</h3>
+  <p>Click the button below to copy the full bookmarklet URL to your clipboard.</p>
+  <button class="btn" id="copy-btn" disabled>⏳ Loading…</button>
+  <button class="btn btn-grey" id="show-btn" disabled>Show code</button>
+  <div id="bm-status">Reading bookmarklet.js…</div>
+  <textarea id="bm-code" placeholder="Code will appear here once loaded…" style="display:none" readonly></textarea>
+</div>
+
+<div class="card">
+  <h3>Step 2 — Save as a bookmark on iOS Safari</h3>
+  <div class="step"><span class="step-num">1</span><span>Bookmark <strong>any</strong> page first (tap the share icon → <strong>Add Bookmark</strong>).</span></div>
+  <div class="step"><span class="step-num">2</span><span>Open <strong>Bookmarks</strong> (<code>⎙</code> icon → Bookmarks tab).</span></div>
+  <div class="step"><span class="step-num">3</span><span><strong>Edit</strong> the bookmark you just created. Change its name to <code>Runner Bot</code>.</span></div>
+  <div class="step"><span class="step-num">4</span><span><strong>Delete the URL field completely</strong>, then <strong>paste</strong> the copied code.</span></div>
+  <div class="step"><span class="step-num">5</span><span>Tap <strong>Done</strong>.</span></div>
+
+  <div class="note">
+    On <strong>desktop Safari / Chrome</strong> you can drag the bookmarklet link directly to your bookmarks bar — no editing needed.
+  </div>
+</div>
+
+<div class="card">
+  <h3>Step 3 — Use the bot</h3>
+  <div class="step"><span class="step-num">1</span><span>Open <strong>icemancountdown.com/runner</strong> in Safari.</span></div>
+  <div class="step"><span class="step-num">2</span><span>Tap your bookmarks, then tap <strong>Runner Bot</strong>.</span></div>
+  <div class="step"><span class="step-num">3</span><span>A control bar appears at the bottom of the screen. Tap <strong>▶ Start</strong>.</span></div>
+  <div class="step"><span class="step-num">4</span><span>The bot plays forever. Tap <strong>■ Stop</strong> or close the tab to stop it.</span></div>
+</div>
+
+<hr class="divider" />
+
+<!-- ═══════════════════════════════════════════════════════════════════════
+     OPTION B – USERSCRIPT (BEST)
+     ═══════════════════════════════════════════════════════════════════════ -->
+<h2>Option B — Userscript <span class="badge badge-best">Recommended for iOS</span></h2>
+<p>Auto-runs every time you open the game — no bookmarklet tap needed. Requires the free <strong>Userscripts</strong> app (iOS / iPadOS).</p>
+
+<div class="card">
+  <h3>Step 1 — Install the Userscripts app</h3>
+  <p>Search <strong>"Userscripts"</strong> on the App Store (by Justin Wasack, free &amp; open-source).<br>
+     Or: <code>apps.apple.com/app/userscripts/id1463298887</code></p>
+</div>
+
+<div class="card">
+  <h3>Step 2 — Enable the Safari Extension</h3>
+  <div class="step"><span class="step-num">1</span><span>Go to <strong>Settings → Safari → Extensions</strong>.</span></div>
+  <div class="step"><span class="step-num">2</span><span>Enable <strong>Userscripts</strong> and grant permission for <em>all websites</em> (or just icemancountdown.com).</span></div>
+</div>
+
+<div class="card">
+  <h3>Step 3 — Add the script</h3>
+  <div class="step"><span class="step-num">1</span><span>Open the <strong>Userscripts</strong> app.</span></div>
+  <div class="step"><span class="step-num">2</span><span>Tap <strong>+</strong> → <strong>New script</strong>.</span></div>
+  <div class="step"><span class="step-num">3</span><span>Delete the placeholder text and <strong>paste the contents of <code>userscript.js</code></strong> from this folder.</span></div>
+  <div class="step"><span class="step-num">4</span><span>Save. The script is now active on icemancountdown.com/runner.</span></div>
+
+  <div class="note">
+    The panel appears automatically when you open the game. Tap <strong>▶ Start</strong> to begin.
+    You only need to set this up once — it persists across sessions.
+  </div>
+</div>
+
+<hr class="divider" />
+
+<!-- ═══════════════════════════════════════════════════════════════════════
+     OPTION C – CHROME / FIREFOX EXTENSION (DESKTOP + CHROME ANDROID)
+     ═══════════════════════════════════════════════════════════════════════ -->
+<h2>Option C — Browser Extension <span class="badge badge-ext">Desktop + Chrome Android</span></h2>
+<p>Load the <code>game-bot-plugin/</code> folder as an unpacked extension.</p>
+
+<div class="card">
+  <h3>Chrome / Edge / Brave</h3>
+  <div class="step"><span class="step-num">1</span><span>Go to <code>chrome://extensions</code></span></div>
+  <div class="step"><span class="step-num">2</span><span>Enable <strong>Developer mode</strong> (top-right toggle)</span></div>
+  <div class="step"><span class="step-num">3</span><span>Click <strong>Load unpacked</strong> → select the <code>game-bot-plugin/</code> folder</span></div>
+  <div class="step"><span class="step-num">4</span><span>Open <code>icemancountdown.com/runner</code> — the panel appears automatically</span></div>
+  <div class="note warn">
+    Chrome Android does not support extensions. Use the bookmarklet or userscript on Android Chrome.
+  </div>
+</div>
+
+<div class="card">
+  <h3>Firefox</h3>
+  <div class="step"><span class="step-num">1</span><span>Go to <code>about:debugging#/runtime/this-firefox</code></span></div>
+  <div class="step"><span class="step-num">2</span><span>Click <strong>Load Temporary Add-on</strong> → select <code>manifest.json</code></span></div>
+  <div class="step"><span class="step-num">3</span><span>Open the game — panel appears automatically</span></div>
+</div>
+
+<hr class="divider" />
+
+<!-- ═══════════════════════════════════════════════════════════════════════
+     HOW THE BOT WORKS
+     ═══════════════════════════════════════════════════════════════════════ -->
+<h2>How the bot works</h2>
+<div class="card">
+  <ul style="line-height:2.2">
+    <li><strong>60 fps rAF scan loop</strong> — reads a vertical slice of canvas pixels every frame</li>
+    <li><strong>Two obstacle zones</strong> — ground zone triggers <code>Jump</code>, air zone triggers <code>Duck</code></li>
+    <li><strong>Adaptive scan distance</strong> — scan columns shift right every 30 s as the game speeds up</li>
+    <li><strong>Air-time guard</strong> — won't re-jump while already airborne (avoids wasted jumps)</li>
+    <li><strong>Rhythm fallback</strong> — if canvas pixel reads are blocked (iOS security), uses an auto-adaptive timed jump rhythm instead</li>
+    <li><strong>Direct game hook</strong> — probes <code>window.game</code>, <code>window.runner</code>, etc. to call <code>.jump()</code> / <code>.duck()</code> natively</li>
+    <li><strong>Touch + keyboard + pointer events</strong> — all three input types fired simultaneously</li>
+    <li><strong>Auto-restart</strong> — detects game-over by canvas freeze and restarts automatically</li>
+    <li><strong>Background recalibration</strong> — resamples sky colour every 8 s to handle palette shifts</li>
+  </ul>
+</div>
+
+<script>
+  const copyBtn = document.getElementById("copy-btn");
+  const showBtn = document.getElementById("show-btn");
+  const status  = document.getElementById("bm-status");
+  const codeEl  = document.getElementById("bm-code");
+
+  let bookmarkletUrl = "";
+
+  function buildBookmarklet(code) {
+    // Wrap the IIFE in javascript:void(...) — this is the bookmarklet URL
+    return "javascript:void(" + code.trim() + ")";
+  }
+
+  function onLoaded(code) {
+    bookmarkletUrl = buildBookmarklet(code);
+
+    copyBtn.disabled = false;
+    copyBtn.textContent = "📋 Copy Bookmarklet";
+    showBtn.disabled = false;
+    status.textContent = "✓ Ready — click Copy, then follow the steps below.";
+    status.className = "ok";
+  }
+
+  function onError() {
+    status.textContent = "⚠ Could not auto-load. Open bookmarklet.js, copy its entire contents, then paste into a bookmark URL field.";
+    status.className = "err";
+    copyBtn.disabled = true;
+    copyBtn.textContent = "Copy (unavailable)";
+    showBtn.disabled = false; // still allow showing
+  }
+
+  // Try to fetch bookmarklet.js from the same directory
+  fetch("./bookmarklet.js")
+    .then(r => { if (!r.ok) throw new Error(); return r.text(); })
+    .then(onLoaded)
+    .catch(onError);
+
+  copyBtn.addEventListener("click", async () => {
+    if (!bookmarkletUrl) return;
+    try {
+      await navigator.clipboard.writeText(bookmarkletUrl);
+      copyBtn.textContent = "✓ Copied!";
+      setTimeout(() => { copyBtn.textContent = "📋 Copy Bookmarklet"; }, 2500);
+    } catch (_) {
+      // Clipboard API may be restricted (iOS without HTTPS)
+      codeEl.style.display = "block";
+      codeEl.value = bookmarkletUrl;
+      codeEl.select();
+      document.execCommand("copy");
+      status.textContent = "Fallback: code shown below — long-press → Copy All.";
+      status.className = "ok";
+    }
+  });
+
+  showBtn.addEventListener("click", () => {
+    codeEl.style.display = codeEl.style.display === "none" ? "block" : "none";
+    if (bookmarkletUrl) codeEl.value = bookmarkletUrl;
+    showBtn.textContent = codeEl.style.display !== "none" ? "Hide code" : "Show code";
+  });
+</script>
+</body>
+</html>
